@@ -38,11 +38,11 @@
 - 不要直接在 zip 裡面雙擊檔案，要先解壓縮（否則會出現「請先解壓縮」的訊息）。
 - 不要放在 OneDrive 或桌面同步資料夾裡：股價資料有兩千多個小檔案，同步會很慢。
 - 第一次雙擊 `.bat` 檔時，Windows 可能跳出藍色的「Windows 已保護您的電腦」（SmartScreen）：按**「其他資訊」→「仍要執行」**。也可以先在 zip 檔上按右鍵 →「內容」，勾選最下面的「解除封鎖」再解壓縮，就不會跳出來。
-- 電腦要先裝好 Python 3.9 以上；沒裝的話下一步會告訴你怎麼裝。
+- 電腦要有 Python 3.9 以上。沒裝也沒關係：下一步 `setup.bat` 找不到 Python 時會問你「要不要幫你安裝？」，打 **Y** 就會幫你安裝 Python 3.12（只裝給你這個 Windows 帳號，不需要系統管理員權限，需要網路）；打 **N** 或直接按 Enter 的話，畫面會列出自己安裝的步驟。
 
 **2. 雙擊 `setup.bat`（只要做一次）**
 
-它會依序：檢查 Python → 問你 3 個問題（都可以直接按 Enter 用預設值）→ 問你要不要現在下載股價資料。
+它會依序：檢查 Python（找不到的話會問你要不要幫你安裝）→ 問你 3 個問題（都可以直接按 Enter 用預設值）→ 問你要不要現在下載股價資料。
 
 | 問題 | 說明 |
 |---|---|
@@ -121,7 +121,7 @@
 | 7 | 自選股清單有問題（找不到檔案、第一列沒有「代號」、沒有任何代號、清單裡的代號都找不到資料） | 照畫面說明修改 `自選股.csv`；不用的話把 `設定.txt` 的 `mode` 改成 `full` |
 | 8 | 檔案編碼不對（`自選股.csv` 或 `設定.txt` 是 UTF-16 等讀不懂的編碼），或命令列視窗不是 UTF-8 | 用記事本另存新檔，編碼選 UTF-8；或改用雙擊 `run.bat` |
 | 9 | `設定.txt` 有問題 | 看畫面上說的行號修改，或重新雙擊 `setup.bat` |
-| 20 | 找不到 Python（或版本低於 3.9） | 到 https://www.python.org/downloads/ 安裝最新版 Python 3，再雙擊一次 |
+| 20 | 找不到 Python（或版本低於 3.9），或 `setup.bat` 的自動安裝沒有完成 | 雙擊 `setup.bat`，問「要不要幫你安裝？」時打 Y；或到 https://www.python.org/downloads/ 自己安裝最新版 Python 3，再雙擊一次 |
 | 21 | 找不到 `screener.py`（沒解壓縮，或只複製了 `.bat` 檔） | 在 zip 上按右鍵「全部解壓縮」，再雙擊解壓縮後資料夾裡的 `setup.bat` |
 | 22 | Windows 打不開程式所在的資料夾路徑 | 把整個資料夾複製到本機磁碟（例如 `D:\tw-stock-screener`） |
 
@@ -140,7 +140,7 @@
   python --version
   ```
 
-  顯示 `Python 3.x.x` 即可。若出現「找不到 python」，請到 https://www.python.org/downloads/ 安裝，安裝時勾選 **Add python.exe to PATH**。
+  顯示 `Python 3.x.x` 即可。若出現「找不到 python」，可以雙擊 `setup.bat`，它會問你要不要幫你安裝（見「常見問題」的「`setup.bat` 怎麼幫我裝 Python？」）；或自己到 https://www.python.org/downloads/ 安裝，安裝時勾選 **Add python.exe to PATH**。
 - 網路能連到 `www.twse.com.tw`（證交所）與 `www.tpex.org.tw`（櫃買中心）
 - 磁碟空間約 100 MB（快取與整理後的資料，實測約 70 MB，之後每天增加）
 
@@ -165,7 +165,7 @@
 |---|---|
 | `screener.py` | 選股主程式 |
 | `fetch_data.py` | 抓全市場日 K、除權息還原，建立 `data/` |
-| `setup.bat` | 初次設定精靈：檢查 Python、問幾個問題、產生 `設定.txt`、下載資料 |
+| `setup.bat` | 初次設定精靈：檢查 Python（找不到時可幫你安裝）、問幾個問題、產生 `設定.txt`、下載資料 |
 | `run.bat` | 每日一鍵：更新資料、選股、用瀏覽器打開結果頁 |
 | `run_daily.bat` | 給排程用的相容包裝：等於 `run.bat`，但不暫停、不開瀏覽器 |
 | `設定.範例.txt` | 設定檔範例（`setup.bat` 會依它產生 `設定.txt`） |
@@ -506,7 +506,21 @@ python fetch_data.py backfill --start 20261001 --end 20261001
 - 自己編輯 `自選股.csv`、`設定.txt` 時，存檔編碼請選 UTF-8。
 
 **執行 `run.bat` 說找不到 python？**
-照畫面上的步驟安裝 Python（https://www.python.org/downloads/），安裝程式若有「Add python.exe to PATH」要打勾；或設定 `TWSTOCK_PY`（見第 4 節）。
+雙擊同一個資料夾裡的 `setup.bat`，問「要不要幫你安裝？」時打 Y，它就會幫你安裝 Python（`run.bat` 本身不會安裝任何東西）。也可以自己安裝（https://www.python.org/downloads/，安裝程式若有「Add python.exe to PATH」要打勾），或設定 `TWSTOCK_PY`（見第 4 節）。
+
+**`setup.bat` 怎麼幫我裝 Python？**
+只有在電腦上找不到 Python、而且你在「要不要幫你安裝？」打 Y 的時候才會做；直接按 Enter 等於 N，什麼都不會裝，只會列出自己安裝的步驟。流程是：
+1. 先試 Windows 內建的 winget：`winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements`。如果跳出「使用者帳戶控制」視窗，按「是」。
+2. 電腦沒有 winget，或 winget 沒裝好，就改從 Python 官方網站下載 3.12.10 的安裝程式（`https://www.python.org/ftp/python/3.12.10/`，依電腦種類自動挑 64 位元、ARM64 或 32 位元的檔案）。畫面會印出來源網址和檔案的 SHA256；只有檔案帶著有效的 Python Software Foundation 數位簽章才會執行，簽章不對就停下來，不會執行。
+3. 安裝參數是 `/quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_test=0`（只裝給目前這個帳號、加入 PATH、不裝測試套件）。安裝程式下載後放在暫存資料夾，裝完就刪除；安裝紀錄在 `logs\python_install*.log`。
+4. 裝完會在同一個視窗重新找 Python，找到就接著設定；找不到的話，關掉視窗再雙擊一次 `setup.bat`。
+
+想移除的話：Windows「設定」→「應用程式」，解除安裝「Python 3.12」。
+
+**裝好 Python 了，`setup.bat` 還是說找不到？**
+- 剛裝完的 Python 要重新開啟的視窗才看得到：關掉視窗再雙擊一次 `setup.bat`；還是不行就重新開機。
+- Windows 內建的 Microsoft Store 假 `python`（只會跳出商店）會擋住真的 Python：到 Windows「設定」→「應用程式」→「進階應用程式設定」→「應用程式執行別名」，把 `python.exe` 和 `python3.exe` 關掉。
+- 也可以直接指定位置：設定環境變數 `TWSTOCK_PY` 指向 `python.exe`（見第 4 節）。
 
 **雙擊 `.bat` 視窗一閃就消失？**
 成功時視窗會停 15 秒，失敗時會停住等你按鍵。如果真的一閃而過，多半是檔案沒解壓縮就雙擊（先在 zip 上按右鍵「全部解壓縮」），或被防毒軟體擋掉；可以改開 cmd 視窗，進到資料夾後輸入 `run.bat` 看訊息。

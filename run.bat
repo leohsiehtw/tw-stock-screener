@@ -162,11 +162,8 @@ rem ===== messages below are data read by :msg and :msgv; cmd never executes the
 ::PYENV_BAD|注意：環境變數 TWSTOCK_PY 指定的 Python 不能用，改找電腦上的 Python。
 ::NOPY|【沒有完成】找不到 Python
 ::NOPY|原因：這台電腦還沒有安裝 Python（需要 3.9 以上的版本），或安裝時沒有讓系統找得到它。
-::NOPY|怎麼做：
-::NOPY|  1. 用瀏覽器打開 https://www.python.org/downloads/ ，下載最新版的 Python 3（Windows 版）。
-::NOPY|  2. 執行下載的安裝程式。如果畫面上有「Add python.exe to PATH」，請把它打勾。
-::NOPY|  3. 按 Install Now（或安裝程式上意思相同的安裝按鈕），等它裝完，然後把視窗關掉。
-::NOPY|  4. 再雙擊一次 run.bat（第一次使用請雙擊 setup.bat）。
+::NOPY|怎麼做：雙擊同一個資料夾裡的 setup.bat，它會問你「要不要幫你安裝？」，打 Y 就會幫你安裝 Python。
+::NOPY|也可以自己裝：用瀏覽器打開 https://www.python.org/downloads/ ，下載安裝程式並執行（畫面上有「Add python.exe to PATH」請打勾），裝完把視窗關掉，再雙擊一次 run.bat。
 ::NOEXTRACT|【沒有完成】請先解壓縮
 ::NOEXTRACT|原因：同一個資料夾裡找不到 screener.py，可能是直接在 zip 檔裡雙擊，或只複製了 .bat 檔。
 ::NOEXTRACT|怎麼做：在 zip 檔上按右鍵選「全部解壓縮」，再打開解壓縮後的資料夾雙擊 setup.bat。

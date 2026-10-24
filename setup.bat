@@ -34,6 +34,7 @@ echo(
 call :msg STEP1
 call :findpy
 if not defined PYCMD goto :nopython
+:py_ok
 call :msg PYFOUND
 %PYCMD% --version
 
@@ -203,6 +204,15 @@ exit /b 0
 set "RC=20"
 echo(
 call :msg NOPY
+echo(
+call :ask_yn Q_INSTALL N
+if /i "%YN%"=="Y" goto :inst_go
+call :msgl LOGNOINST
+echo(
+call :msg NOPY_STOP
+call :msg NOPY_HOW
+echo(
+call :msg NOPY_TIP
 goto :end
 
 :notextracted
@@ -216,6 +226,159 @@ set "RC=22"
 echo(
 call :msg NOCD
 goto :end
+
+:inst_go
+echo(
+call :msg INST_START
+call :msgl LOGINST
+set PS="%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist %PS% set "PS=powershell"
+set "WRC=1"
+if defined TWSTOCK_TEST_WINGET goto :wg_stub
+winget --version >nul 2>&1
+if errorlevel 1 goto :wg_none
+echo(
+call :msg WG_RUN
+winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
+set "WRC=%ERRORLEVEL%"
+goto :wg_done
+:wg_stub
+if /i "%TWSTOCK_TEST_WINGET%"=="missing" goto :wg_none
+if /i "%TWSTOCK_TEST_WINGET%"=="ok" set "WRC=0"
+:wg_done
+call :msgl LOGWG
+call :redetect
+if defined PYCMD goto :inst_ok
+if "%WRC%"=="0" goto :inst_reopen
+echo(
+call :msg WG_FAIL
+goto :inst_download
+:wg_none
+echo(
+call :msg WG_NONE
+call :msgl LOGWG
+goto :inst_download
+
+:inst_download
+set "PYVER=3.12.10"
+set "PYARCH=%PROCESSOR_ARCHITECTURE%"
+if defined PROCESSOR_ARCHITEW6432 set "PYARCH=%PROCESSOR_ARCHITEW6432%"
+set "PYFILE=python-%PYVER%-amd64.exe"
+if /i "%PYARCH%"=="ARM64" set "PYFILE=python-%PYVER%-arm64.exe"
+if /i "%PYARCH%"=="x86" set "PYFILE=python-%PYVER%.exe"
+set "PYURL=https://www.python.org/ftp/python/%PYVER%/%PYFILE%"
+set "PYDIR="
+set "PYEXE="
+set "PYSHA="
+if defined TEMP set "PYDIR=%TEMP%\twstock-python-setup"
+if not defined PYDIR goto :dlpy_fail
+call :rm_pydir
+mkdir "%PYDIR%"
+set "PYEXE=%PYDIR%\%PYFILE%"
+echo(
+call :msg DLPY
+call :msgl LOGDLPY
+if defined TWSTOCK_TEST_DOWNLOAD goto :dlpy_stub
+%PS% -NoProfile -NonInteractive -Command "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri $env:PYURL -OutFile $env:PYEXE" <nul >> "%LOG%" 2>&1
+if errorlevel 1 goto :dlpy_fail
+goto :dlpy_have
+:dlpy_stub
+if /i "%TWSTOCK_TEST_DOWNLOAD%"=="fail" goto :dlpy_fail
+> "%PYEXE%" echo stub
+:dlpy_have
+if not exist "%PYEXE%" goto :dlpy_fail
+for /f "usebackq delims=" %%h in (`call %PS% -NoProfile -NonInteractive -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath $env:PYEXE).Hash" ^<nul 2^>nul`) do set "PYSHA=%%h"
+if not defined PYSHA call :msgv SHA_NA PYSHA
+echo(
+call :msg DLPY_HASH
+if /i "%TWSTOCK_TEST_DOWNLOAD%"=="ok" goto :dlpy_sigskip
+if /i "%TWSTOCK_TEST_DOWNLOAD%"=="instfail" goto :dlpy_sigskip
+set "SIGOK="
+for /f "usebackq delims=" %%s in (`call %PS% -NoProfile -NonInteractive -Command "$s=Get-AuthenticodeSignature -LiteralPath $env:PYEXE;if($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -match 'O=Python Software Foundation'){'SIGOK'}" ^<nul 2^>nul`) do set "SIGOK=%%s"
+if not "%SIGOK%"=="SIGOK" goto :dlpy_badsig
+:dlpy_sigskip
+call :msg DLPY_SIGOK
+echo(
+call :msg PY_INSTALLING
+call :msgl LOGPYINST
+set "IRC=0"
+if defined TWSTOCK_TEST_DOWNLOAD goto :dlpy_inst_stub
+"%PYEXE%" /quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_test=0 /log "%HERE%\logs\python_install.log"
+set "IRC=%ERRORLEVEL%"
+goto :dlpy_inst_done
+:dlpy_inst_stub
+if /i "%TWSTOCK_TEST_DOWNLOAD%"=="instfail" set "IRC=1603"
+:dlpy_inst_done
+if "%IRC%"=="3010" set "IRC=0"
+call :rm_pydir
+if not "%IRC%"=="0" goto :pyinst_fail
+call :redetect
+if defined PYCMD goto :inst_ok
+goto :inst_reopen
+
+:dlpy_fail
+echo(
+call :msg DLPY_FAIL
+call :rm_pydir
+goto :inst_fail
+
+:dlpy_badsig
+echo(
+call :msg DLPY_BADSIG
+call :rm_pydir
+goto :inst_fail
+
+:pyinst_fail
+echo(
+call :msg PYINST_FAIL
+goto :inst_fail
+
+:inst_ok
+set "RC=0"
+echo(
+call :msg INST_OK
+call :msgl LOGINSTOK
+goto :py_ok
+
+:inst_reopen
+echo(
+call :msg INST_REOPEN
+call :msgl LOGREOPEN
+goto :end
+
+:inst_fail
+echo(
+call :msg INST_FAIL
+call :msg NOPY_HOW
+call :msgl LOGINSTFAIL
+goto :end
+
+:rm_pydir
+if not defined PYDIR exit /b 0
+if exist "%PYDIR%" rd /s /q "%PYDIR%"
+exit /b 0
+
+:redetect
+echo(
+call :msg REDETECT
+set "NEWPATH=;"
+if not defined TWSTOCK_TEST_REGPATH for /f "usebackq delims=" %%p in (`call %PS% -NoProfile -NonInteractive -Command "([Environment]::GetEnvironmentVariable('Path','Machine')+';'+[Environment]::GetEnvironmentVariable('Path','User')).Replace([string][char]34,'')" ^<nul 2^>nul`) do set "NEWPATH=%%p"
+if not defined TWSTOCK_TEST_REGPATH if not "%NEWPATH:system32=%"=="%NEWPATH%" set "PATH=%NEWPATH%"
+if defined TWSTOCK_TEST_REGPATH set "PATH=%TWSTOCK_TEST_REGPATH%"
+call :findpy
+if defined PYCMD exit /b 0
+call :probe_py "%LOCALAPPDATA%\Programs\Python\Launcher\py.exe" -3
+if defined PYCMD exit /b 0
+for /d %%d in ("%LOCALAPPDATA%\Programs\Python\Python3*") do if not defined PYCMD call :probe_py "%%~d\python.exe"
+exit /b 0
+
+:probe_py
+if not exist "%~1" exit /b 0
+"%~1" %~2 -c "import sys;sys.exit(0 if sys.version_info>=(3,9) else 1)" >nul 2>&1
+if errorlevel 1 exit /b 0
+if "%~2"=="" set PYCMD="%~1"
+if not "%~2"=="" set PYCMD="%~1" %~2
+exit /b 0
 
 :msg
 setlocal EnableDelayedExpansion
@@ -236,13 +399,45 @@ exit /b 0
 
 rem ===== messages below are data read by :msg and :msgv; cmd never executes them =====
 ::PYENV_BAD|注意：環境變數 TWSTOCK_PY 指定的 Python 不能用，改找電腦上的 Python。
-::NOPY|【沒有完成】找不到 Python
+::NOPY|【找不到 Python】
 ::NOPY|原因：這台電腦還沒有安裝 Python（需要 3.9 以上的版本），或安裝時沒有讓系統找得到它。
-::NOPY|怎麼做：
-::NOPY|  1. 用瀏覽器打開 https://www.python.org/downloads/ ，下載最新版的 Python 3（Windows 版）。
-::NOPY|  2. 執行下載的安裝程式。如果畫面上有「Add python.exe to PATH」，請把它打勾。
-::NOPY|  3. 按 Install Now（或安裝程式上意思相同的安裝按鈕），等它裝完，然後把視窗關掉。
-::NOPY|  4. 再雙擊一次 setup.bat。
+::NOPY|我可以幫你安裝 Python 3.12：用 Python 官方的安裝程式，只裝給你這個 Windows 帳號，不需要系統管理員權限。需要網路，通常幾分鐘就好。
+::Q_INSTALL|要不要幫你安裝？（Y/N，直接按 Enter = N）：
+::NOPY_STOP|【沒有完成】還沒有 Python，設定先停在這裡。
+::NOPY_HOW|怎麼自己裝 Python：
+::NOPY_HOW|  1. 用瀏覽器打開 https://www.python.org/downloads/ ，下載最新版的 Python 3（Windows 版）。
+::NOPY_HOW|  2. 執行下載的安裝程式。如果畫面上有「Add python.exe to PATH」，請把它打勾。
+::NOPY_HOW|  3. 按 Install Now（或安裝程式上意思相同的安裝按鈕），等它裝完，然後把視窗關掉。
+::NOPY_HOW|  4. 再雙擊一次 setup.bat。
+::NOPY_TIP|想讓 setup.bat 幫你安裝的話：再雙擊一次 setup.bat，問「要不要幫你安裝？」時打 Y 再按 Enter。
+::INST_START|好，開始安裝。安裝完成前請不要關掉這個視窗。
+::WG_RUN|正在用 Windows 內建的 winget 安裝 Python 3.12……
+::WG_RUN|（如果跳出「使用者帳戶控制」視窗，按「是」就可以。）
+::WG_NONE|這台電腦沒有 winget，改從 Python 官方網站下載安裝程式。
+::WG_FAIL|winget 沒有裝好（代碼 !WRC!），改從 Python 官方網站下載安裝程式。
+::DLPY|正在下載 Python !PYVER! 安裝程式，通常幾分鐘內完成，請稍等……
+::DLPY|來源網址：!PYURL!
+::DLPY_FAIL|下載失敗：連不上 Python 官方網站，或網路中斷了。
+::DLPY_HASH|下載完成。檔案的 SHA256 雜湊值：!PYSHA!
+::SHA_NA|（無法計算）
+::DLPY_SIGOK|安全檢查通過：檔案有 Python 官方（Python Software Foundation）的有效數位簽章。
+::DLPY_BADSIG|安全檢查沒有通過：這個檔案沒有 Python 官方（Python Software Foundation）的有效數位簽章，所以不會執行它。
+::PY_INSTALLING|正在安裝 Python，通常幾分鐘內完成。這段時間畫面不會動，請耐心等，不要關掉視窗……
+::PYINST_FAIL|安裝程式沒有成功（代碼 !IRC!）。
+::REDETECT|正在重新尋找 Python……
+::INST_OK|找到 Python 了，繼續設定。
+::INST_REOPEN|【還差一步】Python 應該已經裝好了，但這個視窗還找不到它。
+::INST_REOPEN|怎麼做：關掉這個視窗，再雙擊一次 setup.bat，就會接著設定。
+::INST_REOPEN|（再試一次還是說找不到 Python 的話，請重新開機後再雙擊 setup.bat。）
+::INST_FAIL|【沒有完成】沒辦法自動安裝 Python（原因在上面）。
+::LOGINST|使用者選擇自動安裝 Python
+::LOGNOINST|使用者選擇不安裝 Python
+::LOGWG|winget 步驟結束 代碼 !WRC!
+::LOGDLPY|開始從 Python 官方網站下載 !PYURL!
+::LOGPYINST|開始執行 Python 安裝程式
+::LOGINSTOK|安裝後找到 Python 了
+::LOGREOPEN|Python 已安裝但這個視窗找不到，請重開 setup.bat
+::LOGINSTFAIL|自動安裝 Python 失敗
 ::NOEXTRACT|【沒有完成】請先解壓縮
 ::NOEXTRACT|原因：同一個資料夾裡找不到 screener.py，可能是直接在 zip 檔裡雙擊，或只複製了 .bat 檔。
 ::NOEXTRACT|怎麼做：在 zip 檔上按右鍵選「全部解壓縮」，再打開解壓縮後的資料夾雙擊 setup.bat。

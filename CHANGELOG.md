@@ -1,5 +1,20 @@
 # 更新紀錄
 
+## v1.1.1 - 2026-10-25
+
+目標：沒有 Python 的人，也能只靠雙擊 `setup.bat` 完成安裝。
+
+### 新增
+- `setup.bat` 找不到 Python 3.9 以上時，會說明原因並問「要不要幫你安裝？」：打 Y 才會安裝，打 N 或直接按 Enter 只列出手動安裝步驟（結束代碼 20）。
+- 安裝方式：先用 winget 安裝 Python 3.12（`--scope user`，不需要系統管理員權限）；沒有 winget 或沒裝好，改從 python.org 下載 3.12.10 安裝程式（依電腦種類挑檔案），印出來源網址和 SHA256，必須有 Python Software Foundation 的有效數位簽章才執行，裝完刪除暫存的安裝程式。裝完在同一個視窗重新找 Python，找到就接著設定，找不到則提示關掉視窗再雙擊一次。
+- 自動測試：`tests/test_usability.py` 新增 `.bat` 結構檢查（每個會下載或安裝的動作前一行都要有測試開關、只能連 python.org、不用 `certutil`／`bitsadmin`／`curl`／`-ExecutionPolicy`）和 `TestSetupInstallPython`（實際執行 `setup.bat`，涵蓋 Y／N／亂打的答案、winget 成功／失敗、下載失敗、簽章不符、安裝程式失敗、各種電腦種類的網址）。測試用 `TWSTOCK_TEST_WINGET`、`TWSTOCK_TEST_DOWNLOAD`、`TWSTOCK_TEST_REGPATH` 三個開關，只要有設定就絕不會連網下載、也不會執行安裝程式。
+
+### 變更
+- `run.bat` 找不到 Python 時，改成提示雙擊 `setup.bat` 並打 Y 讓它安裝（`run.bat` 本身不安裝任何東西）。
+
+### 未變更
+- 選股邏輯、所有門檻與輸出格式（`.html`、`.csv`、`.md`、`.json`、`.txt`）完全沒有改動。
+
 ## v1.1.0 - 2026-10-24
 
 目標：不會用命令列的人，也能雙擊使用。
