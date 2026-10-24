@@ -7,8 +7,12 @@
 
 設計：cache/ 放原始每日快照（未還原），data/*.csv 每次都由 cache + 除權息事件整批重建，
 還原價不會被重複套用。csv 欄位 date,open,high,low,close,volume,raw_close,name。
+
+結束代碼：0 成功；3 連不上官方網站；4 官方網站回應異常或資料格式不對；
+5 官方還沒提供完整資料（上市有、上櫃還沒有）；6 還沒有任何股價資料（要先 backfill）；
+1 程式發生未預期的錯誤。
 """
-import argparse, csv, datetime as dt, glob, json, os, re, ssl, sys, time
+import argparse, csv, datetime as dt, glob, http.client, json, os, re, ssl, sys, time, traceback
 import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,19 +38,67 @@ RETRY = (10, 30, 90)      # 失敗後等待秒數再重試
 KEEP = re.compile(r'^(?:[1-9]\d{3}|00\d{2,4}[A-Z]?)$')   # 一般股 + ETF
 NODATA = '沒有符合條件'
 
+E_NETWORK, E_SITE, E_NODATA, E_NEED_DATA = 3, 4, 5, 6
+
+MSG_NETWORK = ('連不上證交所或櫃買中心的網站（可能沒有網路，或被公司網路、防毒軟體擋住）。',
+               '確認瀏覽器打得開 https://www.twse.com.tw/ 之後再執行一次；已經抓到的資料會保留。')
+MSG_SITE = ('官方網站暫時沒有正常回應（可能在維護、太忙，或暫時擋住太頻繁的連線）{days}。',
+            '等 30 分鐘以上再執行一次，只會補抓缺的日期；不要連續重跑。')
+MSG_FORMAT = ('官方網站回傳的資料格式和程式認得的不一樣（網站可能改版了）。',
+              '請到 GitHub 專案頁看有沒有新版本；沒有的話請開 Issue 並附上 logs 資料夾裡的紀錄。')
+MSG_NODATA = ('官方還沒有提供完整資料：{days} 證交所有、櫃買中心還沒有。',
+              '通常是官方還在更新，請 30 分鐘後再執行一次；隔天還是這樣的話，請看 README 的常見問題。')
+MSG_NEED = ('還沒有任何股價資料（cache 資料夾是空的）。',
+            '請先雙擊 setup.bat，問到「要現在下載嗎」時選 Y；或在程式資料夾執行 python fetch_data.py backfill。')
+
 _last = [0.0]
 
 
 class FetchError(Exception):
-    """網路／HTTP／非 JSON／暫時性錯誤，可重試"""
+    """網路／HTTP／非 JSON／暫時性錯誤，可重試。kind：network 連不上；site 官方回應異常"""
+
+    def __init__(self, msg, kind='site'):
+        super().__init__(msg)
+        self.kind = kind
 
 
 class Structure(Exception):
     """回傳結構認不得，不重試"""
 
 
+class UserError(Exception):
+    """給使用者看的失敗：代碼、原因、怎麼做"""
+
+    def __init__(self, code, cause, todo):
+        super().__init__(cause)
+        self.code, self.cause, self.todo = code, cause, todo
+
+
+def _tee(line):
+    p = os.environ.get('TWSTOCK_LOG')
+    if p:
+        try:
+            with open(p, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        except OSError:
+            pass
+
+
 def log(*a):
-    print(dt.datetime.now().strftime('%H:%M:%S'), *a, flush=True)
+    line = ' '.join([dt.datetime.now().strftime('%H:%M:%S')] + [str(x) for x in a])
+    print(line, flush=True)
+    _tee(line)
+
+
+def fail(code, cause, todo):
+    for line in ('', '【沒有完成】', '原因：' + cause, '怎麼做：' + todo):
+        print(line, flush=True)
+        _tee(line)
+    sys.exit(code)
+
+
+def fmt_days(ds):
+    return '、'.join(ds[:5]) + (' 等 %d 天' % len(ds) if len(ds) > 5 else '')
 
 
 # ---------- 小工具 ----------
@@ -99,14 +151,18 @@ def http_json(url):
         req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': 'application/json'})
         with urllib.request.urlopen(req, timeout=60, context=CTX) as r:
             raw = r.read()
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise FetchError('%s: %s' % (url, e))
+    except urllib.error.HTTPError as e:          # HTTPError 是 URLError 的子類，要放最前面
+        raise FetchError('%s: %s' % (url, e), 'site')
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        raise FetchError('%s: %s' % (url, e), 'network')
+    except ValueError as e:
+        raise FetchError('%s: %s' % (url, e), 'site')
     finally:
         _last[0] = time.time()
     try:
         return json.loads(raw.decode('utf-8-sig'))
     except ValueError:
-        raise FetchError('non-JSON response: ' + url)
+        raise FetchError('non-JSON response: ' + url, 'site')
 
 
 def retrying(fn):
@@ -116,7 +172,7 @@ def retrying(fn):
         except FetchError as e:
             if i == len(RETRY):
                 raise
-            log('retry in %ds (%s)' % (RETRY[i], str(e)[:120]))
+            log('連線失敗，%d 秒後重試（%s）' % (RETRY[i], str(e)[:120]))
             time.sleep(RETRY[i])
 
 
@@ -357,7 +413,7 @@ def build():
             for code, name, o, h, l, c, v in d['rows']:
                 bars.setdefault(code, []).append((d['date'], o, h, l, c, v, name))
     if not dates:
-        raise SystemExit('cache 是空的，先跑 backfill')
+        raise UserError(E_NEED_DATA, *MSG_NEED)
     latest = max(dates)
     ev = load_events()
     os.makedirs(DATA, exist_ok=True)
@@ -400,67 +456,95 @@ def parse_ymd(s):
     return dt.datetime.strptime(s, '%Y%m%d').date()
 
 
+def _site_cause(site_days):
+    days = '，沒抓到：' + fmt_days(site_days) if site_days else ''
+    return MSG_SITE[0].format(days=days), MSG_SITE[1]
+
+
+def _incomplete(site_days, nodata):
+    """資料不完整時丟出對應的 UserError；都沒問題就什麼都不做"""
+    if site_days:
+        raise UserError(E_SITE, *_site_cause(site_days))
+    if nodata:
+        raise UserError(E_NODATA, MSG_NODATA[0].format(days=fmt_days(nodata)), MSG_NODATA[1])
+
+
 def cmd_backfill(a):
     today = dt.date.today()
     end = parse_ymd(a.end) if a.end else today
     start = parse_ymd(a.start) if a.start else today - dt.timedelta(days=430)
     days = list(weekdays(start, end))
-    cnt, bad = {}, 0
+    cnt, kinds, site_days, nodata = {}, set(), [], []
     log('backfill %s ~ %s, %d weekdays' % (start, end, len(days)))
     for i, iso in enumerate(days, 1):
         try:
             st = fetch_day(iso, today.isoformat())
         except FetchError as e:
             st = 'error'
+            kinds.add(e.kind)
+            if e.kind != 'network':
+                site_days.append(iso)
             log('ERROR', iso, str(e)[:200])
         cnt[st] = cnt.get(st, 0) + 1
         if st not in ('skipped',):
             log('[%d/%d] %s %s' % (i, len(days), iso, st))
-        if st in ('tpex-missing', 'error'):
-            bad += 1
+        if st == 'tpex-missing':
+            nodata.append(iso)
+        if 'network' in kinds:
+            break
+    if 'network' in kinds:
+        raise UserError(E_NETWORK, *MSG_NETWORK)
     sync_exright(start, end)
     build()
     log('summary', cnt)
-    return 1 if bad else 0
+    _incomplete(site_days, nodata)
+    return 0
 
 
 def cmd_daily(a):
     today = dt.date.today()
     cached = [os.path.basename(p)[:8] for m in ('twse', 'tpex') for p in glob.glob(os.path.join(CACHE, m, '*.json'))]
     if not cached:
-        log('cache 是空的，先跑 backfill')
-        return 1
+        raise UserError(E_NEED_DATA, *MSG_NEED)
     last = parse_ymd(max(cached))
     start = last - dt.timedelta(days=14)
     deadline = dt.datetime.combine(today, dt.time(16, 0))
     open_t = dt.datetime.combine(today, dt.time(13, 30))
-    bad = 0
+    kinds, site_days, nodata = set(), [], []
     for iso in weekdays(start, today):
         while True:
             try:
                 st = fetch_day(iso, today.isoformat())
             except FetchError as e:
                 st = 'error'
+                kinds.add(e.kind)
+                if e.kind != 'network':
+                    site_days.append(iso)
                 log('ERROR', iso, str(e)[:200])
             if iso != today.isoformat() or st not in ('empty', 'tpex-missing'):
                 break
             now = dt.datetime.now()
             if now < open_t:
+                log('今天還沒收盤或資料還沒公布（建議 14:30 之後再執行），這次先用前一個交易日的資料。')
                 break
             if now >= deadline:
                 break
-            log('%s 尚無資料 (%s)，600 秒後重試' % (iso, st))
+            log('官方還沒公布 %s 的資料（%s），10 分鐘後自動再試，最晚等到 16:00；不想等可以先關掉視窗，晚點再執行。' % (iso, st))
             time.sleep(600)
+        if 'network' in kinds:
+            break
         if st != 'skipped':
             log(iso, st)
         if st == 'empty':
             if dt.datetime.now() >= deadline:
-                log('no new bar (holiday)')
-        elif st in ('tpex-missing', 'error'):
-            bad += 1
-    if bad:
-        log('FAIL: %d 天資料不完整（tpex-missing/error），不重建' % bad)
-        return 1
+                log('官方今天沒有資料，視為休市。')
+        elif st == 'tpex-missing':
+            nodata.append(iso)
+    if 'network' in kinds:
+        raise UserError(E_NETWORK, *MSG_NETWORK)
+    if site_days or nodata:
+        log('資料不完整，這次不重建 data/。')
+        _incomplete(site_days, nodata)
     sync_exright(start, today)
     build()
     return 0
@@ -482,9 +566,22 @@ def main():
     a = ap.parse_args()
     try:
         sys.exit({'backfill': cmd_backfill, 'daily': cmd_daily, 'build': cmd_build}[a.cmd](a))
-    except (Structure, FetchError) as e:
+    except UserError as e:
+        fail(e.code, e.cause, e.todo)
+    except Structure as e:
         log('FAIL:', e)
-        sys.exit(1)
+        fail(E_SITE, *MSG_FORMAT)
+    except FetchError as e:
+        log('FAIL:', e)
+        if e.kind == 'network':
+            fail(E_NETWORK, *MSG_NETWORK)
+        fail(E_SITE, *_site_cause([]))
+    except Exception as e:
+        text = traceback.format_exc()
+        print(text, flush=True, end='')
+        _tee(text.rstrip())
+        fail(1, '程式發生未預期的錯誤：%s: %s' % (type(e).__name__, e),
+             '請把上面的錯誤訊息（或 logs 資料夾裡今天的紀錄檔）貼到 GitHub 專案的 Issues 回報。')
 
 
 if __name__ == '__main__':
