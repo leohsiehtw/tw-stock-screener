@@ -83,4 +83,4 @@ run_daily.bat force    # 略過週末檢查
 
 ## 授權
 
-尚未指定授權條款（發佈前請自行加入 LICENSE）。
+MIT License，詳見 [LICENSE](LICENSE)。
