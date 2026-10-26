@@ -2,8 +2,9 @@
 
 執行：python -m unittest discover -s tests -v
 """
-import argparse, contextlib, csv, datetime as dt, io, json, os, re, subprocess, sys, tempfile, threading, unittest
-import urllib.error
+import argparse, contextlib, csv, datetime as dt, gzip, http.client, io, json, os, re, subprocess, sys, tempfile
+import threading, time, unittest, _thread
+import urllib.error, urllib.parse
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -411,20 +412,28 @@ class TestScanCli(TempCase):
         self.assertEqual((o['capital'], o['risk'], o['list'], o['out_dir']), (1.0, 0.04, 'x.csv', 'o'))
 
 
+def isolate_net(tc, sleep_fails=True, **over):
+    """測試用：快取／資料指到暫存資料夾、不連網、不真的等待、不印 log"""
+    vals = dict(GAP=0, RETRY=(), CACHE=os.path.join(tc.tmp, 'cache'), DATA=os.path.join(tc.tmp, 'data'))
+    vals.update(over)
+    patches = [mock.patch.object(fetch_data, k, v) for k, v in vals.items()]
+    patches += [mock.patch.object(fetch_data, '_proxied', return_value=False),
+                mock.patch.object(fetch_data.http.client, 'HTTPSConnection', side_effect=AssertionError('不該連網')),
+                mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=AssertionError('不該連網')),
+                mock.patch.object(fetch_data, 'log')]
+    if sleep_fails:
+        patches.append(mock.patch.object(fetch_data, '_sleep', side_effect=AssertionError('不該等待')))
+    fetch_data._reset_net()
+    tc.addCleanup(fetch_data._reset_net)
+    for p in patches:
+        p.start()
+        tc.addCleanup(p.stop)
+
+
 class TestFetch(TempCase):
     def setUp(self):
         super().setUp()
-        for target, val in (('GAP', 0), ('RETRY', ()), ('CACHE', os.path.join(self.tmp, 'cache')),
-                            ('DATA', os.path.join(self.tmp, 'data'))):
-            p = mock.patch.object(fetch_data, target, val)
-            p.start()
-            self.addCleanup(p.stop)
-        p = mock.patch.object(fetch_data.time, 'sleep', side_effect=AssertionError('不該等待'))
-        p.start()
-        self.addCleanup(p.stop)
-        p = mock.patch.object(fetch_data, 'log')
-        p.start()
-        self.addCleanup(p.stop)
+        isolate_net(self)
 
     ROW = ['1101', '台泥', 10.0, 11.0, 9.0, 10.5, 1000]
 
@@ -440,19 +449,70 @@ class TestFetch(TempCase):
                 fetch_data.write_day(m, d.isoformat(), [self.ROW])
 
     def test_http_json_kinds(self):
-        with mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=urllib.error.URLError('x')):
-            with self.assertRaises(fetch_data.FetchError) as cm:
-                fetch_data.http_json('https://example.invalid/')
-        self.assertEqual(cm.exception.kind, 'network')
-        err = urllib.error.HTTPError('https://example.invalid/', 403, 'forbidden', {}, None)
-        with mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=err):
-            with self.assertRaises(fetch_data.FetchError) as cm:
-                fetch_data.http_json('https://example.invalid/')
-        self.assertEqual(cm.exception.kind, 'site')
+        def kind(resp):
+            with mock.patch.object(fetch_data, '_open', side_effect=resp if isinstance(resp, Exception) else None,
+                                   return_value=None if isinstance(resp, Exception) else resp):
+                with self.assertRaises(fetch_data.FetchError) as cm:
+                    fetch_data.http_json('https://example.invalid/')
+            return cm.exception
+        e = kind(OSError('x'))
+        self.assertEqual((e.kind, e.blocked), ('network', False))
+        for code in (403, 429):
+            e = kind((code, {}, b''))
+            self.assertEqual((e.kind, e.blocked), ('site', True))
+        e = kind((200, {}, b'  <html><body>blocked</body></html>'))
+        self.assertEqual((e.kind, e.blocked), ('site', True))
+        self.assertIn('網頁', str(e))
+        for resp in ((500, {}, b''), (302, {'Location': 'https://x/errors'}, b''), (200, {}, b'oops'),
+                     (200, {'Content-Encoding': 'gzip'}, b'not gzip'), (200, {'Content-Encoding': 'br'}, b'{}')):
+            e = kind(resp)
+            self.assertEqual((e.kind, e.blocked), ('site', False), resp)
+        ok = gzip.compress('{"stat":"OK","名稱":"台泥"}'.encode('utf-8'))
+        with mock.patch.object(fetch_data, '_open', return_value=(200, {'Content-Encoding': 'gzip'}, ok)):
+            self.assertEqual(fetch_data.http_json('https://example.invalid/')['名稱'], '台泥')
+        with mock.patch.object(fetch_data, '_open', return_value=(200, {}, '{"a":1}'.encode('utf-8-sig'))):
+            self.assertEqual(fetch_data.http_json('https://example.invalid/'), {'a': 1})
+
+    def test_http_json_via_proxy_path(self):
+        class R:
+            status = 200
+            headers = {}
+
+            def __init__(self, body, url):
+                self.body, self.url = body, url
+
+            def read(self):
+                return self.body
+
+            def geturl(self):
+                return self.url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        url = 'https://example.invalid/x?a=1'
+        with mock.patch.object(fetch_data, '_proxied', return_value=True):
+            with mock.patch.object(fetch_data.urllib.request, 'urlopen', return_value=R(b'{"a":1}', url)):
+                self.assertEqual(fetch_data.http_json(url), {'a': 1})
+            err = urllib.error.HTTPError(url, 429, 'slow', {}, io.BytesIO(b''))
+            with mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=err):
+                with self.assertRaises(fetch_data.FetchError) as cm:
+                    fetch_data.http_json(url)
+            self.assertTrue(cm.exception.blocked)
+            with mock.patch.object(fetch_data.urllib.request, 'urlopen', return_value=R(b'{}', 'https://other/')):
+                with self.assertRaises(fetch_data.FetchError) as cm:      # 被轉址 = 網站錯誤
+                    fetch_data.http_json(url)
+            self.assertEqual((cm.exception.kind, cm.exception.blocked), ('site', False))
+            with mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=urllib.error.URLError('x')):
+                with self.assertRaises(fetch_data.FetchError) as cm:
+                    fetch_data.http_json(url)
+            self.assertEqual(cm.exception.kind, 'network')
 
     def test_daily_network_down(self):
         self.preload()
-        with mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=urllib.error.URLError('x')) as m:
+        with mock.patch.object(fetch_data, '_open', side_effect=OSError('x')) as m:
             with self.assertRaises(fetch_data.UserError) as cm:
                 fetch_data.cmd_daily(None)
         self.assertEqual(cm.exception.code, 3)
@@ -474,16 +534,391 @@ class TestFetch(TempCase):
 
     def test_backfill_network_down(self):
         a = argparse.Namespace(start='20260302', end='20260306')
-        with mock.patch.object(fetch_data.urllib.request, 'urlopen', side_effect=urllib.error.URLError('x')) as m:
+        with mock.patch.object(fetch_data, '_open', side_effect=OSError('x')) as m:
             with self.assertRaises(fetch_data.UserError) as cm:
                 fetch_data.cmd_backfill(a)
         self.assertEqual(cm.exception.code, 3)
         self.assertEqual(m.call_count, 1)
+        self.assertTrue(fetch_data.STOP.is_set())
 
     def test_build_empty_cache(self):
         with self.assertRaises(fetch_data.UserError) as cm:
             fetch_data.build()
         self.assertEqual(cm.exception.code, 6)
+
+
+REAL_LOG = fetch_data.log
+
+
+class Clock:
+    """假時鐘：_sleep 只是把時間往前撥"""
+
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+        self.lock = threading.Lock()
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        with self.lock:
+            self.sleeps.append(s)
+            self.t += s
+
+
+def fake_clock(tc):
+    c = Clock()
+    for name, fn in (('_now', c.now), ('_sleep', c.sleep)):
+        p = mock.patch.object(fetch_data, name, fn)
+        p.start()
+        tc.addCleanup(p.stop)
+    return c
+
+
+class FakeSite:
+    """假的證交所／櫃買中心：依網址回傳格式正確的 JSON，並記下每次請求"""
+
+    def __init__(self, holidays=(), clock=None):
+        self.holidays = set(holidays)
+        self.urls = []
+        self.lock = threading.Lock()
+        self.clock = clock
+
+    def days(self, kind):
+        out = []
+        for u in self.urls:
+            if kind in u:
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(u).query)
+                out.append(q['date'][0].replace('/', '').replace('-', ''))
+        return out
+
+    def body(self, url):
+        u = urllib.parse.urlsplit(url)
+        q = urllib.parse.parse_qs(u.query)
+        if 'MI_INDEX' in u.path:
+            iso = q['date'][0]
+            if '%s-%s-%s' % (iso[:4], iso[4:6], iso[6:]) in self.holidays:
+                return {'stat': '很抱歉，沒有符合條件的資料!'}
+            f = ['證券代號', '證券名稱', '成交股數', '成交筆數', '成交金額', '開盤價', '最高價', '最低價', '收盤價']
+            return {'stat': 'OK', 'tables': [{'fields': f, 'data': [['1101', '台泥', '1,000', '1', '1', '10', '11', '9', '10.5']]}]}
+        if 'afterTrading/otc' in u.path:
+            y, m, d = q['date'][0].split('/')
+            f = ['代號', '名稱', '收盤', '開盤', '最高', '最低', '成交股數']
+            return {'stat': 'ok', 'tables': [{'date': '%d/%s/%s' % (int(y) - 1911, m, d), 'fields': f,
+                                              'data': [['6488', '環球晶', '10.5', '10', '11', '9', '1,000']]}]}
+        if 'TWT49U' in u.path:
+            return {'stat': 'OK', 'fields': ['資料日期', '股票代號', '除權息前收盤價', '除權息參考價'],
+                    'data': [['115年03月05日', '1101', '10', '9.5']]}
+        if 'exDailyQ' in u.path:
+            return {'stat': 'ok', 'tables': [{'fields': ['除權息日期', '代號', '除權息前收盤價', '除權息參考價'], 'data': []}]}
+        raise AssertionError('不認得的網址 ' + url)
+
+    def __call__(self, url):
+        with self.lock:
+            self.urls.append(url)
+        return 200, {}, json.dumps(self.body(url), ensure_ascii=False).encode('utf-8')
+
+
+class TestNet(TempCase):
+    def setUp(self):
+        super().setUp()
+        isolate_net(self, sleep_fails=False)
+
+    # ---- 規劃 ----
+    def test_plan_days(self):
+        start, end = dt.date(2025, 8, 20), dt.date(2026, 10, 22)
+        days, weeks = fetch_data.plan_days(start, end, True)
+        every = list(fetch_data.weekdays(start, end))
+        self.assertEqual(dt.date.fromisoformat(days[0]).weekday(), 0)
+        self.assertGreaterEqual(len(days), fetch_data.DENSE_WEEKS * 5 - 10)
+        self.assertEqual(days[-1], '2026-10-22')
+        seen = [iso for wk in weeks for iso in wk] + days
+        self.assertEqual(sorted(seen), every)                       # 不漏、不重複
+        self.assertEqual(len(seen), len(set(seen)))
+        for wk in weeks:
+            self.assertEqual(wk, sorted(wk, reverse=True))          # 週五在前
+            self.assertEqual(len({dt.date.fromisoformat(x).isocalendar()[:2] for x in wk}), 1)
+            self.assertLess(wk[0], days[0])
+        self.assertEqual(weeks, sorted(weeks))                      # 舊的週在前
+        self.assertEqual(weeks[0][-1], '2025-08-20')                # 第一週從 start 起算
+        self.assertEqual(len(weeks[0]), 3)
+        d2, w2 = fetch_data.plan_days(start, end, False)
+        self.assertEqual((d2, w2), (every, []))
+        d3, w3 = fetch_data.plan_days(dt.date(2026, 5, 4), end, True)   # 範圍比 34 週短：全部每天抓
+        self.assertEqual((d3, w3), (list(fetch_data.weekdays(dt.date(2026, 5, 4), end)), []))
+
+    # ---- 限速 ----
+    def test_gap_per_host_fake_clock(self):
+        clock = fake_clock(self)
+        starts = []
+
+        def op(url):
+            starts.append((urllib.parse.urlsplit(url).netloc, clock.t))
+            return 200, {}, b'{"a":1}'
+        with mock.patch.object(fetch_data, '_open', side_effect=op), \
+                mock.patch.object(fetch_data, 'GAP', 3.0):
+            for i in range(3):
+                fetch_data.get('https://a.example/x%d' % i, lambda d: d)
+            self.assertEqual(clock.sleeps, [3.0, 3.0])
+            fetch_data.get('https://b.example/y', lambda d: d)         # 另一個網站不必等
+            self.assertEqual(clock.sleeps, [3.0, 3.0])
+        self.assertEqual([t for h, t in starts if h == 'a.example'], [0.0, 3.0, 6.0])
+        self.assertEqual(starts[-1], ('b.example', 6.0))
+
+    def test_retry_waits_only_that_host(self):
+        clock = fake_clock(self)
+        starts = []
+        seq = iter([OSError('x'), None])
+
+        def op(url):
+            host = urllib.parse.urlsplit(url).netloc
+            starts.append((host, clock.t))
+            if host == 'a.example':
+                e = next(seq)
+                if e:
+                    raise e
+            return 200, {}, b'{"a":1}'
+        with mock.patch.object(fetch_data, '_open', side_effect=op), \
+                mock.patch.object(fetch_data, 'GAP', 3.0), mock.patch.object(fetch_data, 'RETRY', (10, 30, 90)):
+            fetch_data.get('https://a.example/x', lambda d: d)
+            self.assertEqual(clock.sleeps, [10])
+            fetch_data.get('https://b.example/y', lambda d: d)
+            self.assertEqual(clock.sleeps, [10])                      # B 沒有被 A 的重試拖慢
+        self.assertEqual(starts, [('a.example', 0.0), ('a.example', 10.0), ('b.example', 10.0)])
+        h = fetch_data._hosts['a.example']
+        self.assertEqual((h.slow, h.retries, h.count), (0.0, 1, 2))
+        self.assertFalse(fetch_data.STOP.is_set())
+
+    def test_two_blocks_stop(self):
+        clock = fake_clock(self)
+        with mock.patch.object(fetch_data, '_open', return_value=(429, {}, b'')) as m, \
+                mock.patch.object(fetch_data, 'GAP', 3.0), mock.patch.object(fetch_data, 'RETRY', (10, 30, 90)):
+            with self.assertRaises(fetch_data.FetchError) as cm:
+                fetch_data.get('https://a.example/x', lambda d: d)
+        self.assertTrue(cm.exception.blocked)
+        self.assertEqual(m.call_count, 2)
+        self.assertTrue(fetch_data.STOP.is_set())
+        self.assertEqual(fetch_data._hosts['a.example'].slow, fetch_data.GAP_MAX)
+        self.assertEqual(clock.sleeps, [10])
+        with self.assertRaises(fetch_data._Aborted):                  # 停了就不再送
+            fetch_data.get('https://b.example/x', lambda d: d)
+        self.assertEqual(m.call_count, 2)
+
+    def test_threads_one_request_per_host_and_gap(self):
+        active, starts, lock = {}, {}, threading.Lock()
+        over = []
+
+        def op(url):
+            host = urllib.parse.urlsplit(url).netloc
+            with lock:
+                active[host] = active.get(host, 0) + 1
+                if active[host] > 1:
+                    over.append(host)
+                starts.setdefault(host, []).append(time.perf_counter())
+            time.sleep(0.03)
+            with lock:
+                active[host] -= 1
+            return 200, {}, b'{"a":1}'
+
+        def work(host):
+            for i in range(6):
+                fetch_data.get('https://%s/%d' % (host, i), lambda d: d)
+        t0 = time.perf_counter()
+        with mock.patch.object(fetch_data, '_open', side_effect=op), mock.patch.object(fetch_data, 'GAP', 0.2):
+            ts = [threading.Thread(target=work, args=(h,)) for h in ('a.example', 'b.example') for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+        took = time.perf_counter() - t0
+        self.assertEqual(over, [])
+        for host, st in starts.items():
+            self.assertEqual(len(st), 12)
+            self.assertGreaterEqual(min(b - a for a, b in zip(st, st[1:])), 0.19, host)
+        self.assertLess(abs(starts['a.example'][0] - starts['b.example'][0]), 0.15)    # 兩個網站同時開始
+        self.assertLess(took, 3.6)                                    # 不是兩個網站排隊
+
+    # ---- 保持連線 ----
+    def test_keep_alive_and_reconnect(self):
+        made = []
+
+        class Resp:
+            status = 200
+            will_close = False
+            headers = {'Content-Encoding': 'gzip'}
+
+            def read(self):
+                return gzip.compress(b'{"a":1}')
+
+        class Conn:
+            def __init__(self, host, **kw):
+                self.n, self.closed = 0, False
+                made.append(self)
+
+            def request(self, method, path, headers=None):
+                self.n += 1
+                assert headers['Accept-Encoding'] == 'gzip' and method == 'GET'
+                if len(made) == 1 and self.n == 3:
+                    raise http.client.RemoteDisconnected('stale')
+
+            def getresponse(self):
+                return Resp()
+
+            def close(self):
+                self.closed = True
+        with mock.patch.object(fetch_data.http.client, 'HTTPSConnection', Conn):
+            self.assertEqual(fetch_data.http_json('https://a.example/1'), {'a': 1})
+            self.assertEqual(fetch_data.http_json('https://a.example/2'), {'a': 1})
+            self.assertEqual(len(made), 1)                           # 兩次請求共用一條連線
+            self.assertEqual(fetch_data.http_json('https://a.example/3'), {'a': 1})   # 閒置斷線：重連一次
+            self.assertEqual(len(made), 2)
+            self.assertTrue(made[0].closed)
+
+    def test_disconnect_on_fresh_connection_is_network_error(self):
+        class Conn:
+            def __init__(self, host, **kw):
+                pass
+
+            def request(self, *a, **k):
+                raise http.client.RemoteDisconnected('x')
+
+            def close(self):
+                pass
+        with mock.patch.object(fetch_data.http.client, 'HTTPSConnection', Conn):
+            with self.assertRaises(fetch_data.FetchError) as cm:
+                fetch_data.http_json('https://a.example/1')
+        self.assertEqual(cm.exception.kind, 'network')
+        self.assertNotIn('a.example', fetch_data._conns)
+
+    # ---- 整段回補 ----
+    def run_small(self, site, start=dt.date(2025, 3, 3), end=dt.date(2025, 3, 28)):
+        with mock.patch.object(fetch_data, 'DENSE_WEEKS', 1), mock.patch.object(fetch_data, '_open', site):
+            return fetch_data.run_backfill(start, end, True)
+
+    def test_full_backfill_counts_and_resume(self):
+        fake_clock(self)
+        site = FakeSite(holidays=('2025-03-19', '2025-03-14'))
+        self.assertEqual(self.run_small(site), 0)
+        # 密集 3/17~3/28 共 10 天、1 天休市：9*2+1；週線 3/3 週五 2 次；3/10 週五休市 1 次 + 週四 2 次；除權息 2 次
+        self.assertEqual(len(site.urls), 19 + 2 + 3 + 2)
+        self.assertEqual(sorted(site.days('MI_INDEX')).count('20250312'), 0)          # 週三不抓
+        self.assertEqual(sorted(d for d in site.days('MI_INDEX') if d < '20250317'), ['20250307', '20250313', '20250314'])
+        self.assertEqual(sorted(d for d in site.days('afterTrading/otc') if d < '20250317'), ['20250307', '20250313'])
+        self.assertTrue(os.path.exists(os.path.join(fetch_data.CACHE, 'latest.txt')))
+        self.assertTrue(os.path.exists(os.path.join(fetch_data.DATA, '1101.csv')))
+        with open(os.path.join(fetch_data.CACHE, 'twse', '20250314.json'), encoding='utf-8') as f:
+            self.assertTrue(json.load(f)['holiday'])
+        site2 = FakeSite(holidays=('2025-03-19', '2025-03-14'))
+        self.assertEqual(self.run_small(site2), 0)
+        self.assertEqual(site2.urls, [])                                               # 續跑：什麼都不用再抓
+
+    def test_weekly_friday_holiday_goes_back_only_as_needed(self):
+        fake_clock(self)
+        site = FakeSite(holidays=('2025-03-07', '2025-03-06'))
+        self.run_small(site, end=dt.date(2025, 3, 21))
+        early = sorted(d for d in site.days('MI_INDEX') if d < '20250310')
+        self.assertEqual(early, ['20250305', '20250306', '20250307'])      # 週五、週四都休市 → 週三；週二不抓
+
+    def test_blocked_backfill_exit_4_no_build(self):
+        fake_clock(self)
+        with mock.patch.object(fetch_data, '_open', return_value=(429, {}, b'')) as m, \
+                mock.patch.object(fetch_data, 'build') as b, \
+                mock.patch.object(fetch_data, 'DENSE_WEEKS', 1):
+            with self.assertRaises(fetch_data.UserError) as cm:
+                fetch_data.run_backfill(dt.date(2025, 3, 3), dt.date(2025, 3, 28), True)
+        self.assertEqual(cm.exception.code, 4)
+        self.assertEqual(m.call_count, 2)
+        b.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(fetch_data.CACHE, 'latest.txt')))
+
+    def test_structure_error_no_build(self):
+        fake_clock(self)
+        bad = (200, {}, json.dumps({'stat': 'OK', 'tables': [{'fields': ['x'], 'data': []}]}).encode())
+        with mock.patch.object(fetch_data, '_open', return_value=bad), \
+                mock.patch.object(fetch_data, 'build') as b, mock.patch.object(fetch_data, 'DENSE_WEEKS', 1):
+            with self.assertRaises(fetch_data.Structure):
+                fetch_data.run_backfill(dt.date(2025, 3, 3), dt.date(2025, 3, 28), True)
+        b.assert_not_called()
+
+    def test_explicit_start_is_every_day(self):
+        fake_clock(self)
+        site = FakeSite()
+        a = argparse.Namespace(start='20250303', end='20250307')
+        with mock.patch.object(fetch_data, '_open', site):
+            self.assertEqual(fetch_data.cmd_backfill(a), 0)
+        self.assertEqual(len(site.days('MI_INDEX')), 5)
+        self.assertEqual(len(site.urls), 5 * 2 + 2)
+
+    def test_progress_line_and_estimate(self):
+        fake_clock(self)
+        site = FakeSite()
+        with mock.patch.object(fetch_data, 'DENSE_WEEKS', 1), mock.patch.object(fetch_data, '_open', site), \
+                mock.patch.object(fetch_data, 'GAP', 3.0):
+            fetch_data.run_backfill(dt.date(2025, 3, 3), dt.date(2025, 3, 28), True)
+        lines = [' '.join(str(x) for x in c.args) for c in fetch_data.log.call_args_list]
+        self.assertTrue(any(re.match(r'^\[\d+/12\] 2025-03-\d\d ok（週線用）  剩約 ', x) for x in lines), lines)
+        self.assertTrue(any(re.match(r'^\[\d+/12\] 2025-03-\d\d ok  剩約 (\d+ 分 \d+ 秒|不到 1 分鐘)$', x) for x in lines))
+        self.assertTrue(any(x.startswith('要抓 12 天、除權息 2 個檔（已有快取 0 天），預估約 ') for x in lines))
+        self.assertTrue(any(x.startswith('backfill 2025-03-03 ~ 2025-03-28, 10 weekdays + 2 weeks (weekly only)') for x in lines))
+        self.assertTrue(any(re.match(r'^耗時 .*；請求：證交所 \d+、櫃買中心 \d+；重試 0 次$', x) for x in lines))
+
+    def test_ctrl_c_keeps_valid_cache_and_resumes(self):
+        site = FakeSite()
+        cache = fetch_data.CACHE
+        timer = threading.Timer(0.6, _thread.interrupt_main)
+        t0 = time.monotonic()
+        try:
+            with mock.patch.object(fetch_data, 'GAP', 0.05), mock.patch.object(fetch_data, '_open', site):
+                timer.start()
+                try:
+                    fetch_data.run_backfill(dt.date(2024, 1, 1), dt.date(2024, 12, 31), False)
+                    interrupted = False
+                except KeyboardInterrupt:
+                    interrupted = True
+        finally:
+            timer.cancel()
+        self.assertTrue(interrupted)
+        self.assertLess(time.monotonic() - t0, 8)
+        files = [os.path.join(cache, m, n) for m in ('twse', 'tpex') for n in os.listdir(os.path.join(cache, m))]
+        self.assertTrue(files)
+        for p in files:
+            self.assertFalse(p.endswith('.tmp'), p)
+            with open(p, encoding='utf-8') as f:
+                json.load(f)
+        have = {os.path.basename(p)[:8] for p in files if '%stwse%s' % (os.sep, os.sep) in p}
+        site2 = FakeSite()
+        with mock.patch.object(fetch_data, '_open', site2):
+            self.assertEqual(fetch_data.run_backfill(dt.date(2024, 1, 1), dt.date(2024, 12, 31), False), 0)
+        self.assertTrue(have.isdisjoint(site2.days('MI_INDEX')))                       # 只補缺的
+        self.assertEqual(len(have) + len(set(site2.days('MI_INDEX'))), 262)             # 2024 年有 262 個平日
+
+    # ---- 輸出 ----
+    def test_log_survives_ascii_stdout(self):
+        buf = io.BytesIO()
+        out = io.TextIOWrapper(buf, encoding='ascii', errors='strict')
+        with mock.patch.object(sys, 'stdout', out):
+            REAL_LOG('連線失敗', 'abc')
+            out.flush()
+        text = buf.getvalue().decode('ascii')
+        self.assertIn('abc', text)
+        self.assertIn('\\u9023', text)
+
+    def test_new_messages_encodable_in_cp950(self):
+        import ast
+        with open(os.path.join(ROOT, 'fetch_data.py'), encoding='utf-8') as f:
+            tree = ast.parse(f.read())
+        doc = {id(n.body[0].value) for n in ast.walk(tree)
+               if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)) and n.body
+               and isinstance(n.body[0], ast.Expr) and isinstance(getattr(n.body[0], 'value', None), ast.Constant)}
+        bad = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in doc:
+                try:
+                    n.value.encode('cp950')
+                except UnicodeEncodeError:
+                    bad.append(n.value)
+        self.assertEqual(bad, [])
 
 
 MARK = b'rem ===== messages below'

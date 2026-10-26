@@ -1,7 +1,9 @@
 """從證交所、櫃買中心抓全市場日 K，建立 data/<代號>.csv 給 screener.py 用。只用 Python 內建模組。
 
 用法：
-  python fetch_data.py backfill [--start YYYYMMDD] [--end YYYYMMDD]   補歷史（預設今天往前 430 天，可中斷續跑）
+  python fetch_data.py backfill [--start YYYYMMDD] [--end YYYYMMDD]   補歷史（可中斷續跑）
+      不加 --start：從今天往前 430 天，最近 34 週每天抓、更早的每週只抓最後一個交易日（約 12 分鐘）
+      加了 --start：從那天起每個交易日都抓（和 v1.1.1 一樣，約 38 分鐘）
   python fetch_data.py daily                                          每天收盤後增量更新（需先 backfill 過）
   python fetch_data.py build                                          只用 cache 重建 data/*.csv（離線）
 
@@ -12,8 +14,8 @@
 5 官方還沒提供完整資料（上市有、上櫃還沒有）；6 還沒有任何股價資料（要先 backfill）；
 1 程式發生未預期的錯誤。
 """
-import argparse, csv, datetime as dt, glob, http.client, json, os, re, ssl, sys, time, traceback
-import urllib.error, urllib.request
+import argparse, csv, datetime as dt, glob, gzip, http.client, json, os, queue, re, ssl, sys, threading, time
+import traceback, urllib.error, urllib.parse, urllib.request, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, 'cache')
@@ -33,8 +35,13 @@ TWSE_EX = 'https://www.twse.com.tw/rwd/zh/exRight/TWT49U?startDate={s}&endDate={
 TPEX_EX = 'https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQ?startDate={s}&endDate={e}&response=json'
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
-GAP = 3.5                 # 任兩次請求最短間隔（秒）
-RETRY = (10, 30, 90)      # 失敗後等待秒數再重試
+SPAN_DAYS = 430           # 沒有指定 --start 時，往前補幾天
+DENSE_WEEKS = 34          # 最近幾週每天都抓；更早的每週只抓最後一個交易日
+GAP = 3.0                 # 同一個網站任兩次請求最短間隔（秒）；兩個網站各自計算、同時進行
+GAP_MAX = 10.0            # 被擋（403／429／回傳網頁）之後，那個網站的間隔改成這麼久
+BLOCK_LIMIT = 2           # 被擋第 2 次就停止，不再試
+WORKERS = 4               # 同時作業的執行緒數（每個網站同一時間仍只送一個請求）
+RETRY = (10, 30, 90)      # 失敗後等待秒數再重試（整個網站一起等）
 KEEP = re.compile(r'^(?:[1-9]\d{3}|00\d{2,4}[A-Z]?)$')   # 一般股 + ETF
 NODATA = '沒有符合條件'
 
@@ -51,15 +58,19 @@ MSG_NODATA = ('官方還沒有提供完整資料：{days} 證交所有、櫃買�
 MSG_NEED = ('還沒有任何股價資料（cache 資料夾是空的）。',
             '請先雙擊 setup.bat，問到「要現在下載嗎」時選 Y；或在程式資料夾執行 python fetch_data.py backfill。')
 
-_last = [0.0]
-
 
 class FetchError(Exception):
-    """網路／HTTP／非 JSON／暫時性錯誤，可重試。kind：network 連不上；site 官方回應異常"""
+    """網路／HTTP／非 JSON／暫時性錯誤，可重試。kind：network 連不上；site 官方回應異常；
+    blocked：官方擋住（403／429／回傳網頁而不是資料）"""
 
-    def __init__(self, msg, kind='site'):
+    def __init__(self, msg, kind='site', blocked=False):
         super().__init__(msg)
         self.kind = kind
+        self.blocked = blocked
+
+
+class _Aborted(FetchError):
+    """已經決定停止（STOP 被設定），不是真的錯誤"""
 
 
 class Structure(Exception):
@@ -84,16 +95,35 @@ def _tee(line):
             pass
 
 
+_log_lock = threading.Lock()
+
+
+def _out(line):
+    """印一行；主控台編碼放不下的字改成跳脫寫法，不要讓程式因為印不出來而中斷"""
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        buf = getattr(sys.stdout, 'buffer', None)
+        enc = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        if buf is None:
+            print(line.encode('ascii', 'backslashreplace').decode('ascii'), flush=True)
+        else:
+            buf.write((line + chr(10)).encode(enc, 'backslashreplace'))
+            buf.flush()
+
+
 def log(*a):
     line = ' '.join([dt.datetime.now().strftime('%H:%M:%S')] + [str(x) for x in a])
-    print(line, flush=True)
-    _tee(line)
+    with _log_lock:
+        _out(line)
+        _tee(line)
 
 
 def fail(code, cause, todo):
-    for line in ('', '【沒有完成】', '原因：' + cause, '怎麼做：' + todo):
-        print(line, flush=True)
-        _tee(line)
+    with _log_lock:
+        for line in ('', '【沒有完成】', '原因：' + cause, '怎麼做：' + todo):
+            _out(line)
+            _tee(line)
     sys.exit(code)
 
 
@@ -142,38 +172,191 @@ def _ctx():
 CTX = _ctx()
 
 
+_RESET = (http.client.RemoteDisconnected, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+_conns = {}                # 主機 -> HTTPSConnection（保持連線；只在拿著該主機的鎖時使用）
+_proxy_cache = {}
+
+
+def _proxied(host):
+    """有設 https／all 代理（且這個主機不在略過清單）時，改走 urllib，讓它處理代理"""
+    if host not in _proxy_cache:
+        try:
+            px = urllib.request.getproxies()
+            _proxy_cache[host] = bool(px.get('https') or px.get('all')) and not urllib.request.proxy_bypass(host)
+        except Exception:
+            _proxy_cache[host] = False
+    return _proxy_cache[host]
+
+
+def _drop(host):
+    c = _conns.pop(host, None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+def _open(url):
+    """送一次 GET，回傳 (狀態碼, 標頭, 本文)；不自動跟轉址。測試時換掉這一個函式就不會連網"""
+    u = urllib.parse.urlsplit(url)
+    host = u.netloc
+    path = u.path + ('?' + u.query if u.query else '')
+    hdr = {'User-Agent': UA, 'Accept': 'application/json', 'Accept-Encoding': 'gzip'}
+    if _proxied(host):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=60, context=CTX) as r:
+                body = r.read()
+                final = r.geturl() if hasattr(r, 'geturl') else url
+                return (r.status if final == url else 302), r.headers, body
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+    c = _conns.get(host)
+    reused = c is not None
+    for attempt in (0, 1):
+        if c is None:
+            c = _conns[host] = http.client.HTTPSConnection(host, timeout=60, context=CTX)
+            reused = False
+        try:
+            c.request('GET', path, headers=hdr)
+            r = c.getresponse()
+            body = r.read()
+        except _RESET:
+            _drop(host)
+            if not (reused and attempt == 0):
+                raise
+            c = None                       # 閒置太久被伺服器關掉：重連、重送一次
+        except BaseException:
+            _drop(host)
+            raise
+        else:
+            if r.will_close:
+                _drop(host)
+            return r.status, r.headers, body
+
+
+def _header(headers, name):
+    v = headers.get(name) or headers.get(name.lower())
+    return (v or '').strip().lower()
+
+
 def http_json(url):
-    wait = GAP - (time.time() - _last[0])
-    if wait > 0:
-        time.sleep(wait)
-    _last[0] = time.time()
+    """送一次請求（不重試）並解成 JSON。403／429／回傳網頁會標記 blocked=True"""
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': 'application/json'})
-        with urllib.request.urlopen(req, timeout=60, context=CTX) as r:
-            raw = r.read()
-    except urllib.error.HTTPError as e:          # HTTPError 是 URLError 的子類，要放最前面
-        raise FetchError('%s: %s' % (url, e), 'site')
-    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        status, headers, body = _open(url)
+    except FetchError:
+        raise
+    except (OSError, http.client.HTTPException) as e:
         raise FetchError('%s: %s' % (url, e), 'network')
     except ValueError as e:
         raise FetchError('%s: %s' % (url, e), 'site')
-    finally:
-        _last[0] = time.time()
+    if status in (403, 429):
+        raise FetchError('%s: HTTP %d' % (url, status), 'site', blocked=True)
+    if status != 200:
+        raise FetchError('%s: HTTP %d' % (url, status), 'site')
+    enc = _header(headers, 'Content-Encoding')
+    if enc == 'gzip':
+        try:
+            body = gzip.decompress(body)
+        except (OSError, EOFError, zlib.error) as e:
+            raise FetchError('%s: gzip 解壓縮失敗 %s' % (url, e), 'site')
+    elif enc not in ('', 'identity'):
+        raise FetchError('%s: 不認得的 Content-Encoding %s' % (url, enc), 'site')
     try:
-        return json.loads(raw.decode('utf-8-sig'))
+        return json.loads(body.decode('utf-8-sig'))
     except ValueError:
+        if body.lstrip()[:1] == b'<':
+            raise FetchError('回傳網頁而不是資料: ' + url, 'site', blocked=True)
         raise FetchError('non-JSON response: ' + url, 'site')
 
 
-def retrying(fn):
-    for i in range(len(RETRY) + 1):
-        try:
-            return fn()
-        except FetchError as e:
-            if i == len(RETRY):
+# ---------- 每個網站各自的限速（同一時間一個請求、間隔 GAP 秒） ----------
+class _Host:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.next = 0.0        # 下一個請求最早可以開始的時間
+        self.slow = 0.0        # 被擋之後的間隔（0 = 用 GAP）
+        self.count = 0         # 送出的請求數
+        self.retries = 0       # 重試次數
+
+
+STOP = threading.Event()
+_hosts = {}
+_hosts_lock = threading.Lock()
+_blocks = [0]                  # 被擋的次數（所有網站合計）
+_threads = []
+
+
+def _now():
+    return time.perf_counter()          # Windows 的 monotonic 只有 15 毫秒解析度，間隔會算不準
+
+
+def _sleep(s):
+    """程式裡唯一的等待：收到 STOP 就立刻丟 _Aborted 結束"""
+    if STOP.wait(s):
+        raise _Aborted('已停止')
+
+
+def _host(name):
+    with _hosts_lock:
+        h = _hosts.get(name)
+        if h is None:
+            h = _hosts[name] = _Host()
+        return h
+
+
+def _reset_net():
+    """清掉上一輪的限速、連線與停止旗標（每個指令開始時呼叫）"""
+    for t in list(_threads):
+        if t.is_alive():
+            t.join(5)
+    del _threads[:]
+    STOP.clear()
+    with _hosts_lock:
+        _hosts.clear()
+        _blocks[0] = 0
+    for name in list(_conns):
+        _drop(name)
+
+
+def get(url, parse):
+    """對 url 送請求並用 parse 解析；失敗依 RETRY 重試。同一個網站一次只送一個請求，間隔至少 GAP 秒"""
+    h = _host(urllib.parse.urlsplit(url).netloc)
+    while not h.lock.acquire(timeout=0.5):
+        if STOP.is_set():
+            raise _Aborted('已停止')
+    try:
+        for i in range(len(RETRY) + 1):
+            if STOP.is_set():
+                raise _Aborted('已停止')
+            while h.next - _now() > 0:          # 等到輪到自己；提早醒來就再等
+                _sleep(h.next - _now())
+            t0 = _now()
+            h.next = t0 + max(GAP, h.slow)
+            h.count += 1
+            try:
+                return parse(http_json(url))
+            except _Aborted:
                 raise
-            log('連線失敗，%d 秒後重試（%s）' % (RETRY[i], str(e)[:120]))
-            time.sleep(RETRY[i])
+            except FetchError as e:
+                if e.blocked:
+                    h.slow = GAP_MAX
+                    h.next = max(h.next, t0 + GAP_MAX)
+                    with _hosts_lock:
+                        _blocks[0] += 1
+                        stop = _blocks[0] >= BLOCK_LIMIT
+                    if stop:
+                        STOP.set()
+                        raise
+                if i == len(RETRY):
+                    if e.kind == 'network':
+                        STOP.set()             # 還拿著鎖，其他執行緒不會再送請求
+                    raise
+                log('連線失敗，%d 秒後重試（%s）' % (RETRY[i], str(e)[:120]))
+                h.retries += 1
+                h.next = max(h.next, _now() + RETRY[i])
+    finally:
+        h.lock.release()
 
 
 def col(fields, *names):
@@ -252,13 +435,11 @@ def parse_tpex(d, iso):
 
 
 def fetch_twse(iso):
-    url = TWSE_DAY.format(ymd=iso.replace('-', ''))
-    return retrying(lambda: parse_twse(http_json(url)))
+    return get(TWSE_DAY.format(ymd=iso.replace('-', '')), parse_twse)
 
 
 def fetch_tpex(iso):
-    url = TPEX_DAY.format(slash=iso.replace('-', '%2F'))
-    return retrying(lambda: parse_tpex(http_json(url), iso))
+    return get(TPEX_DAY.format(slash=iso.replace('-', '%2F')), lambda d: parse_tpex(d, iso))
 
 
 # ---------- cache ----------
@@ -271,7 +452,14 @@ def write_atomic(path, text):
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8', newline='') as f:
         f.write(text)
-    os.replace(tmp, path)
+    for i in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:               # 防毒軟體偶爾會暫時鎖住剛寫好的檔案
+            if i == 4:
+                raise
+            _sleep(0.3)
 
 
 def write_day(mkt, iso, rows):
@@ -324,6 +512,51 @@ def weekdays(a, b):
         d += dt.timedelta(days=1)
 
 
+def plan_days(start, end, sparse):
+    """回傳 (每天都抓的日期, 只抓週線用的週)。sparse：最近 DENSE_WEEKS 週每天抓；
+    更早的每週一組（週五在前往週一排），只需要那週最後一個有開市的日子"""
+    if not sparse:
+        return list(weekdays(start, end)), []
+    cut = end - dt.timedelta(weeks=DENSE_WEEKS)
+    cut -= dt.timedelta(days=cut.weekday())               # 對齊到週一
+    if cut <= start:
+        return list(weekdays(start, end)), []
+    weeks = []
+    mon = start - dt.timedelta(days=start.weekday())
+    while mon < cut:
+        wk = [d.isoformat() for d in (mon + dt.timedelta(days=i) for i in range(5)) if start <= d < cut]
+        if wk:
+            weeks.append(wk[::-1])
+        mon += dt.timedelta(days=7)
+    return list(weekdays(cut, end)), weeks
+
+
+def _day_cached(iso):
+    return os.path.exists(cpath('twse', iso)) and os.path.exists(cpath('tpex', iso))
+
+
+def _is_holiday(iso):
+    """快取裡這天是休市記號（檔案很小才讀）"""
+    p = cpath('twse', iso)
+    try:
+        if os.path.getsize(p) >= 200:
+            return False
+        with open(p, encoding='utf-8') as f:
+            return bool(json.load(f).get('holiday'))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _week_cached(wk):
+    """由週五往前：遇到休市記號就看前一天；第一個有開市的日子已經在快取就算這週完成"""
+    for iso in wk:
+        if not _day_cached(iso):
+            return False
+        if not _is_holiday(iso):
+            return True
+    return True
+
+
 # ---------- 除權息 ----------
 def exr_path(mkt, ym):
     return os.path.join(CACHE, 'exright', '%s_%s.json' % (mkt, ym))
@@ -354,11 +587,12 @@ def parse_ex(d, mkt):
     return out
 
 
-def sync_exright(start, end):
-    """抓 start~end 涵蓋月份的除權息；當月與上月每次都重抓"""
+def exright_jobs(start, end):
+    """要抓的除權息檔：[(市場, 年月, 網址, 檔案路徑)]；當月與上月每次都重抓，其他月份有檔就略過"""
     today = dt.date.today()
     cur = today.strftime('%Y%m')
     prev = (today.replace(day=1) - dt.timedelta(days=1)).strftime('%Y%m')
+    jobs = []
     y, m = start.year, start.month
     while (y, m) <= (end.year, end.month):
         ym = '%04d%02d' % (y, m)
@@ -375,10 +609,22 @@ def sync_exright(start, end):
                 else:
                     url = TPEX_EX.format(s=first.strftime('%Y/%m/%d').replace('/', '%2F'),
                                          e=last.strftime('%Y/%m/%d').replace('/', '%2F'))
-                ev = retrying(lambda: parse_ex(http_json(url), mkt))
-                write_atomic(p, json.dumps(ev, ensure_ascii=False, separators=(',', ':')))
-                log('exright %s %s: %d events' % (mkt, ym, len(ev)))
+                jobs.append((mkt, ym, url, p))
         y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return jobs
+
+
+def fetch_exright(job):
+    mkt, ym, url, p = job
+    ev = get(url, lambda d: parse_ex(d, mkt))
+    write_atomic(p, json.dumps(ev, ensure_ascii=False, separators=(',', ':')))
+    log('exright %s %s: %d events' % (mkt, ym, len(ev)))
+
+
+def sync_exright(start, end):
+    """依序抓 start~end 涵蓋月份的除權息（每日更新用）"""
+    for job in exright_jobs(start, end):
+        fetch_exright(job)
 
 
 def load_events():
@@ -469,39 +715,173 @@ def _incomplete(site_days, nodata):
         raise UserError(E_NODATA, MSG_NODATA[0].format(days=fmt_days(nodata)), MSG_NODATA[1])
 
 
-def cmd_backfill(a):
-    today = dt.date.today()
-    end = parse_ymd(a.end) if a.end else today
-    start = parse_ymd(a.start) if a.start else today - dt.timedelta(days=430)
-    days = list(weekdays(start, end))
-    cnt, kinds, site_days, nodata = {}, set(), [], []
-    log('backfill %s ~ %s, %d weekdays' % (start, end, len(days)))
-    for i, iso in enumerate(days, 1):
-        try:
-            st = fetch_day(iso, today.isoformat())
-        except FetchError as e:
-            st = 'error'
-            kinds.add(e.kind)
+def _fmt_dur(s):
+    s = int(round(s))
+    return '%d 分 %d 秒' % (s // 60, s % 60) if s >= 60 else '%d 秒' % s
+
+
+def run_jobs(jobs):
+    """用 min(WORKERS, 工作數) 條背景執行緒做完 jobs（每個是不帶參數的函式）；回傳執行緒裡丟出的非預期例外。
+    Ctrl+C 時立刻通知大家停止，最多等 3 秒再把 KeyboardInterrupt 丟出去"""
+    q = queue.Queue()
+    for j in jobs:
+        q.put(j)
+    errs = []
+
+    def worker():
+        while not STOP.is_set():
+            try:
+                j = q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                j()
+            except _Aborted:
+                return
+            except BaseException as e:
+                errs.append(e)
+                STOP.set()
+                return
+
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(min(WORKERS, len(jobs)))]
+    _threads.extend(ts)
+    for t in ts:
+        t.start()
+    try:
+        for t in ts:
+            while t.is_alive():
+                t.join(0.5)
+    except KeyboardInterrupt:
+        STOP.set()
+        end = time.monotonic() + 3
+        for t in ts:
+            t.join(max(0.0, end - time.monotonic()))
+        raise
+    return errs
+
+
+def run_backfill(start, end, sparse):
+    _reset_net()
+    today_iso = dt.date.today().isoformat()
+    days, weeks = plan_days(start, end, sparse)
+    wk_todo = [wk for wk in weeks if not _week_cached(wk)]
+    d_todo = [iso for iso in days if not _day_cached(iso)]
+    ex_todo = exright_jobs(start, end)
+    total = len(wk_todo) + len(d_todo)
+    cached = len(days) + len(weeks) - total
+    if weeks:
+        log('backfill %s ~ %s, %d weekdays + %d weeks (weekly only)' % (start, end, len(days), len(weeks)))
+    else:
+        log('backfill %s ~ %s, %d weekdays' % (start, end, len(days)))
+    est = max(total + sum(1 for j in ex_todo if j[0] == m) for m in ('twse', 'tpex')) * GAP
+    log('要抓 %d 天、除權息 %d 個檔（已有快取 %d 天），預估約 %d 分鐘；中途關掉視窗也沒關係，再執行一次會接著抓。'
+        % (total, len(ex_todo), cached, max(1, int((est + 59) // 60))))
+
+    lock = threading.Lock()                      # 保護下面的共用狀態；拿著它的時候不可以呼叫 log()
+    st = dict(done=0, units=0.0, cnt={}, kinds=set(), site_days=[], nodata=[], exr_err=[])
+    total_units = total + 0.5 * len(ex_todo)
+    t0 = _now()
+
+    def eta():                                   # 呼叫時要拿著 lock
+        u = st['units']
+        s = (_now() - t0) / u * (total_units - u) if u > 0 else 0
+        return '不到 1 分鐘' if s < 60 else _fmt_dur(s)
+
+    def failed(label, e):
+        with lock:
+            st['kinds'].add(e.kind)
             if e.kind != 'network':
-                site_days.append(iso)
-            log('ERROR', iso, str(e)[:200])
-        cnt[st] = cnt.get(st, 0) + 1
-        if st not in ('skipped',):
-            log('[%d/%d] %s %s' % (i, len(days), iso, st))
-        if st == 'tpex-missing':
-            nodata.append(iso)
-        if 'network' in kinds:
-            break
-    if 'network' in kinds:
+                st['site_days'].append(label)
+        log('ERROR', label, str(e)[:200])
+
+    def finish(label, status, suffix=''):
+        with lock:
+            st['done'] += 1
+            st['units'] += 1
+            st['cnt'][status] = st['cnt'].get(status, 0) + 1
+            if status == 'tpex-missing':
+                st['nodata'].append(label)
+            n, left = st['done'], eta()
+        if status != 'skipped':
+            log('[%d/%d] %s %s%s  剩約 %s' % (n, total, label, status, suffix, left))
+
+    def day_job(iso):
+        def run():
+            try:
+                s = fetch_day(iso, today_iso)
+            except _Aborted:
+                raise
+            except FetchError as e:
+                failed(iso, e)
+                s = 'error'
+            finish(iso, s)
+        return run
+
+    def week_job(wk):
+        def run():
+            s, label = 'holiday', wk[0]
+            try:
+                for iso in wk:
+                    label = iso
+                    r = fetch_day(iso, today_iso)
+                    if r == 'holiday' or (r == 'skipped' and _is_holiday(iso)):
+                        continue
+                    s = r
+                    break
+            except _Aborted:
+                raise
+            except FetchError as e:
+                failed(label, e)
+                s = 'error'
+            finish(label, s, '（週線用）')
+        return run
+
+    def ex_job(job):
+        def run():
+            try:
+                fetch_exright(job)
+            except _Aborted:
+                raise
+            except FetchError as e:
+                with lock:
+                    st['exr_err'].append(e)
+                failed('exright %s %s' % job[:2], e)
+            with lock:
+                st['units'] += 0.5
+        return run
+
+    jobs = [week_job(wk) for wk in wk_todo] + [day_job(iso) for iso in d_todo] + [ex_job(j) for j in ex_todo]
+    try:
+        errs = run_jobs(jobs)
+    except KeyboardInterrupt:
+        log('已中斷，已經抓到的資料會保留；再執行一次會接著抓。')
+        raise
+    if errs:
+        raise errs[0]
+    if 'network' in st['kinds']:
         raise UserError(E_NETWORK, *MSG_NETWORK)
-    sync_exright(start, end)
+    if _blocks[0] >= BLOCK_LIMIT:
+        raise UserError(E_SITE, *_site_cause(sorted(st['site_days'])))
+    if st['exr_err']:
+        raise st['exr_err'][0]
     build()
-    log('summary', cnt)
-    _incomplete(site_days, nodata)
+    log('summary', st['cnt'])
+    n = lambda name: _hosts[name].count if name in _hosts else 0
+    log('耗時 %s；請求：證交所 %d、櫃買中心 %d；重試 %d 次'
+        % (_fmt_dur(_now() - t0), n('www.twse.com.tw'), n('www.tpex.org.tw'), sum(h.retries for h in _hosts.values())))
+    _incomplete(st['site_days'], st['nodata'])
     return 0
 
 
+def cmd_backfill(a):
+    today = dt.date.today()
+    end = parse_ymd(a.end) if a.end else today
+    start = parse_ymd(a.start) if a.start else today - dt.timedelta(days=SPAN_DAYS)
+    return run_backfill(start, end, sparse=not a.start)       # 明確指定 --start：每個交易日都抓
+
+
 def cmd_daily(a):
+    _reset_net()
     today = dt.date.today()
     cached = [os.path.basename(p)[:8] for m in ('twse', 'tpex') for p in glob.glob(os.path.join(CACHE, m, '*.json'))]
     if not cached:
@@ -512,6 +892,8 @@ def cmd_daily(a):
     open_t = dt.datetime.combine(today, dt.time(13, 30))
     kinds, site_days, nodata = set(), [], []
     for iso in weekdays(start, today):
+        if STOP.is_set():
+            break
         while True:
             try:
                 st = fetch_day(iso, today.isoformat())
@@ -558,9 +940,11 @@ def cmd_build(a):
 def main():
     ap = argparse.ArgumentParser(description='抓台股全市場日 K，重建 data/*.csv')
     sp = ap.add_subparsers(dest='cmd', required=True)
-    b = sp.add_parser('backfill', help='補歷史（可續跑）')
-    b.add_argument('--start')
-    b.add_argument('--end')
+    b = sp.add_parser('backfill', help='補歷史（可續跑）',
+                      description='不加 --start：從今天往前 %d 天，最近 %d 週每天抓、更早的每週只抓最後一個交易日（快）；'
+                                  '加了 --start：從那天起每個交易日都抓（慢，約 38 分鐘）。' % (SPAN_DAYS, DENSE_WEEKS))
+    b.add_argument('--start', help='YYYYMMDD；有指定就每個交易日都抓')
+    b.add_argument('--end', help='YYYYMMDD；預設今天')
     sp.add_parser('daily', help='每日增量')
     sp.add_parser('build', help='用 cache 重建 data/*.csv（離線）')
     a = ap.parse_args()

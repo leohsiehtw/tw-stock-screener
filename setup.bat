@@ -477,7 +477,7 @@ rem ===== messages below are data read by :msg and :msgv; cmd never executes the
 ::Q3_PROMPT|請輸入 1 或 2（直接按 Enter = 1）：
 ::CFG_SAVED|設定已經存好，內容是：
 ::STEP4|[4/5] 下載股價資料
-::DL_NEW|還沒有股價資料。第一次要下載約一年半的資料，大約需要 30～60 分鐘（官方網站限速，程式會慢慢抓）。
+::DL_NEW|還沒有股價資料。第一次要下載約一年半的資料，大約需要 12 分鐘（官方網站有限速，程式會照規矩慢慢抓；網路慢的時候會久一點）。
 ::DL_NEW|下載中間關掉視窗也沒關係，之後再雙擊 setup.bat 就會接著抓，不會重來。
 ::Q_DL_NEW|要現在下載嗎？（Y 現在下載／N 以後再說，直接按 Enter = Y）：
 ::DL_HAVE|已經有股價資料了。可以現在補抓到最新的（通常幾分鐘）。
