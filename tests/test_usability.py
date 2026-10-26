@@ -238,6 +238,21 @@ def meta_for(**k):
     return m
 
 
+def wcag_ratio(a, b):
+    """WCAG 2.x 對比值（#rrggbb）"""
+    def lum(h):
+        h = h.lstrip('#')
+        c = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        c = [x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    x, y = sorted((lum(a), lum(b)), reverse=True)
+    return (x + 0.05) / (y + 0.05)
+
+
+TEXT_TOKENS = ('ink', 'ink2', 'link', 'up', 'down', 'warn', 'cap')     # 會拿來寫字的顏色
+BACKGROUNDS = ('page', 'surface', 'nav')
+
+
 class TestRender(unittest.TestCase):
     def test_html_content(self):
         res = fake_results()
@@ -247,17 +262,108 @@ class TestRender(unittest.TestCase):
         self.assertIn('元大S&amp;P500', h)
         self.assertNotIn('<測試>', h)
         self.assertNotIn('<b>x</b>', h)
-        for bad in ('http://', 'https://', '<link', 'src=', '@import', 'url('):
-            self.assertNotIn(bad, h)
         for cls in ('sortable', 't-break', 't-pull', 'p-cap', 'p-odd', 'd-wide', 'd-ok'):
             self.assertIn(cls, h)
         self.assertIn('2026-10-22（星期四）', h)
         self.assertIn('掃描 7 檔（資料有效 6 檔）', h)
         self.assertIn('部位（風險 2%）', h)
         self.assertIn('部位（5%）', h)
+        self.assertIn('已達總資金上限', h)
+        self.assertIn('不到 1 張，零股', h)
         self.assertIn('觀察名單', h)
         self.assertNotIn('資料日期不是今天', h)
         self.assertIn('資料只有 10 天', h)
+        self.assertIn('僅供研究，非投資建議', h)
+        self.assertIn('怎麼看這一頁', h)
+
+    def test_no_external_resources(self):
+        h = screener.render_html(fake_results(), True, meta_for())
+        for bad in ('http://', 'https://', '<link', 'src=', '@import', 'url(', '<iframe', '<img', '//cdn'):
+            self.assertNotIn(bad, h)
+        self.assertEqual(h.count('<script'), 2)            # 明細資料 + 頁面程式，都內嵌
+
+    def test_both_color_schemes_from_palette(self):
+        h = screener.render_html(fake_results(), False, meta_for())
+        self.assertIn('@media (prefers-color-scheme:dark)', h)
+        self.assertIn(':root[data-theme="dark"]', h)
+        for mode in ('light', 'dark'):
+            self.assertIn(screener._css_vars(screener.PALETTE[mode]), h)
+        self.assertEqual(set(screener.PALETTE['light']), set(screener.PALETTE['dark']))
+
+    def test_contrast(self):
+        """文字對背景 ≥ 4.5:1；按鈕文字 ≥ 4.5:1；圖形記號、焦點框、輸入框邊線 ≥ 3:1（淺色、深色都要）"""
+        for mode, p in screener.PALETTE.items():
+            for fg in TEXT_TOKENS:
+                for bg in BACKGROUNDS:
+                    self.assertGreaterEqual(wcag_ratio(p[fg], p[bg]), 4.5, f'{mode} {fg} on {bg}')
+            for bg in ('btn', 'btn_hover', 'btn_active'):
+                self.assertGreaterEqual(wcag_ratio(p['on_btn'], p[bg]), 4.5, f'{mode} on_btn on {bg}')
+            self.assertGreaterEqual(wcag_ratio(p['page'], p['ink']), 4.5, f'{mode} 選取中的篩選按鈕')
+            for fg in ('accent', 'btn', 'ink', 'ink2', 'ink3', 'warn'):
+                for bg in ('page', 'surface'):
+                    self.assertGreaterEqual(wcag_ratio(p[fg], p[bg]), 3, f'{mode} mark {fg} on {bg}')
+        # CSS 裡用來寫字的顏色，只能是上面檢查過的
+        used = set(re.findall(r'[;{]color:var\(--([a-z0-9-]+)\)', screener.HTML_CSS))
+        self.assertTrue(used)
+        self.assertLessEqual(used, set(TEXT_TOKENS) | {'on-btn', 'page'})
+        self.assertAlmostEqual(wcag_ratio('#ffffff', '#000000'), 21.0)
+        self.assertAlmostEqual(wcag_ratio('#777777', '#ffffff'), 4.48, places=2)
+
+    def test_up_down_not_color_only(self):
+        h = screener.render_html(fake_results(), False, meta_for())
+        self.assertIn('<span class="up">▲ +3.10%</span>', h)
+        self.assertIn('<span class="down">▼ -0.80%</span>', h)
+        self.assertIn('<span class="flat">平 0.00%</span>', h)
+        for word in ('<span class="g">近</span>', '<span class="g">遠</span>'):
+            self.assertIn(word, h)
+        self.assertIn('>突破型</span>', h)
+        self.assertIn('>回測型</span>', h)
+
+    def test_filter_sort_controls(self):
+        h = screener.render_html(fake_results(), False, meta_for())
+        for s in ('name="ft"', 'name="fk"', 'id="cq"', 'id="csort"', 'aria-live="polite"', "'aria-sort'",
+                  '全部 4', '突破型 1', '回測型 3', '個股 3', 'ETF 1', 'data-kind="etf" data-code="00646"'):
+            self.assertIn(s, h)
+        self.assertEqual(h.count('<tbody class="cand"'), 4)
+        self.assertGreaterEqual(h.count('<button type="button" class="sb"'), 8 + 7 + 11)
+
+    def test_price_bar(self):
+        res = fake_results()
+        res[0]['ma'] = dict(ma5=121, ma20=116.5, ma60=110, boll_up=125.2, boll_lo=104.8)
+        h = screener.render_html(res, False, meta_for())
+        self.assertIn('停損 117.0</span><span class="k k-ma">MA20 116.5</span>', h)
+        self.assertIn('收盤 120.0', h)
+        self.assertIn('布林 104.8～125.2', h)
+        self.assertEqual(h.count('class="pb" aria-hidden="true"'), 4)    # 沒有 ma 的也畫得出來
+
+    def test_lazy_details(self):
+        res = fake_results()
+        res.append(fake_rec('1234', '</script><b>&', 10.0, 1.0, 1.0))
+        h = screener.render_html(res, False, meta_for())
+        self.assertIn('<details id="stages-det">', h)
+        self.assertIn('<noscript>', h)
+        self.assertIn('<tbody id="st-body"></tbody>', h)
+        self.assertEqual(h.count('</script>'), 2)
+        m = re.search(r'<script type="application/json" id="stage-data">(.*?)</script>', h)
+        rows = json.loads(m.group(1))
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(rows[0], ['1101', '台泥', '120.0', 0b011111, 2.4, '-0.5', '0.7'])
+        self.assertEqual(rows[5][3], 0b000010)          # 1216：只過第 1 關
+        self.assertEqual(rows[6][1], '</script><b>&')
+        self.assertNotIn('1216', h.replace(m.group(0), ''))   # 明細列只在 JSON 裡，展開才產生
+
+    def test_size_budget_large_input(self):
+        res = []
+        for i in range(2400):
+            typ = ('突破型', '回測型')[i % 2] if i % 80 == 0 else None
+            r = fake_rec('%04d' % (1000 + i), '測試股票名稱%d' % i, 100.5 + i, 1.23, 1.5, typ,
+                         95.0 + i if typ else None, watch=(i % 70 == 1))
+            r['ma'] = dict(ma5=101, ma20=99.1 + i, ma60=98, boll_up=110.3 + i, boll_lo=90.2 + i)
+            r['notes'] = ['月線與季線差距沒有擴大（整理中）'] if i % 10 == 0 else []
+            screener.size(r, 1000000, 0.02)
+            res.append(r)
+        h = screener.render_html(res, False, meta_for())
+        self.assertLess(len(h.encode('utf-8')), 500_000)
 
     def test_list_mode_titles_and_missing(self):
         res = fake_results()
@@ -282,8 +388,10 @@ class TestRender(unittest.TestCase):
 
     def test_render_does_not_mutate(self):
         res = fake_results()
+        res[0]['ma'] = dict(ma5=121, ma20=116.5, ma60=110, boll_up=125.2, boll_lo=104.8)
         before = json.dumps(res, ensure_ascii=False, default=str)
         screener.render_html(res, True, meta_for())
+        screener.render_html(res, False, meta_for(capital=None))
         with tempfile.TemporaryDirectory() as d:
             screener.write_csv(os.path.join(d, 'a.csv'), res, 1000000)
         self.assertEqual(before, json.dumps(res, ensure_ascii=False, default=str))
