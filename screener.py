@@ -80,7 +80,91 @@ def load_bars(path):
     return name, [seen[k] for k in sorted(seen)]
 
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# 快速讀檔：只處理 fetch_data.py / add 產生的標準 csv，結果和 load_bars 完全一樣；
+# 有任何不標準的地方（欄名、引號、欄數、編碼、數字格式…）就改用 load_bars 重讀，錯誤訊息也照舊。
+FAST_HEADERS = ('date,open,high,low,close,volume,raw_close,name', 'date,open,high,low,close,volume')
+FAST_FIELD_MAX = 131072          # csv 模組預設的欄位長度上限；超過交給 load_bars 處理
+
+
+def _parse_fast(raw):
+    """回傳 (name, bars)；不是標準格式就回傳 None"""
+    if b'"' in raw:
+        return None
+    text = raw.decode('utf-8-sig').replace('\r\n', '\n')
+    if '\r' in text or '\x00' in text:
+        return None
+    lines = text.split('\n')
+    if lines[0] not in FAST_HEADERS:
+        return None
+    width = 8 if len(lines[0]) == len(FAST_HEADERS[0]) else 6
+    name, seen = '', {}
+    for line in lines[1:]:
+        if not line:
+            continue                 # csv 也略過空白行
+        f = line.split(',')
+        if len(f) != width or len(line) > FAST_FIELD_MAX:
+            return None
+        c = float(f[4])
+        if width == 8:
+            name = f[7] or name
+            rc = float(f[6]) if f[6] != '' else c
+        else:
+            rc = c
+        r = dict(date=f[0], open=float(f[1]), high=float(f[2]), low=float(f[3]), close=c, raw_close=rc,
+                 volume=float(f[5]))
+        if r['volume'] and r['close']:
+            seen[r['date']] = r          # 重複日期以後者為準
+    return name, [seen[k] for k in sorted(seen)]
+
+
+def load_file(path, raw=None):
+    """和 load_bars(path) 結果相同；raw 是已經讀好的檔案內容（None 表示沒讀到，交給 load_bars）"""
+    if raw is not None and not path.endswith('.json'):
+        try:
+            got = _parse_fast(raw)
+        except Exception:
+            got = None
+        if got is not None:
+            return got
+    return load_bars(path)
+
+
+def _read_raw(path):
+    if path.endswith('.json'):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except Exception:
+        return None                  # 讓 load_bars 重讀，丟出和以前一樣的錯誤
+
+
+def read_workers():
+    return min(16, max(4, os.cpu_count() or 4))
+
+
+def prefetch(paths, workers=None):
+    """依 paths 的順序逐一回傳 (path, 檔案內容或 None)；用多個執行緒先讀進來（最多先讀 workers×4 檔）。
+    解析（load_file）由呼叫端做，錯誤才會和以前一樣從呼叫端丟出（不經過 generator）。"""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    workers = workers or read_workers()
+    it = iter(paths)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        q = deque()
+        for p in it:
+            q.append((p, ex.submit(_read_raw, p)))
+            if len(q) >= workers * 4:
+                break
+        while q:
+            p, fut = q.popleft()
+            nxt = next(it, None)
+            if nxt is not None:
+                q.append((nxt, ex.submit(_read_raw, nxt)))
+            yield p, fut.result()
+
+
+HERE =os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, '設定.範例.txt')
 E_NEED_DATA, E_WATCHLIST, E_ENCODING, E_CONFIG = 6, 7, 8, 9
 FIX_CONFIG = '用記事本打開 設定.txt 修改（可以參考 設定.範例.txt），或重新雙擊 setup.bat。'
@@ -333,10 +417,11 @@ def macd(xs):
     return dif, dea, [a - b for a, b in zip(dif, dea)]
 
 
-def boll(xs, n=20, k=2):
+def boll(xs, n=20, k=2, start=0):
+    """start > 0：上下軌、帶寬只算 index ≥ start 的部分（其餘維持 None），算出來的值和全部算時完全一樣"""
     mid = sma(xs, n)
     up, lo, bw = [None] * len(xs), [None] * len(xs), [None] * len(xs)
-    for i in range(n - 1, len(xs)):
+    for i in range(max(n - 1, start), len(xs)):
         w = xs[i - n + 1:i + 1]
         sd = math.sqrt(sum((x - mid[i]) ** 2 for x in w) / n)
         up[i], lo[i] = mid[i] + k * sd, mid[i] - k * sd
@@ -367,7 +452,8 @@ def analyze(code, name, bars):
     t, y = n - 1, n - 2
     ma5, ma20, ma60 = sma(C, 5), sma(C, 20), sma(C, 60)
     dif, dea, osc = macd(C)
-    mid, up, lo, bw = boll(C)
+    # 布林只用到最後幾根：up/lo 的 t、y，與 bw[i-120:i]、bw[i-1]（i = t, y），最早是 bw[n-122]
+    mid, up, lo, bw = boll(C, start=n - P['squeeze_lookback'] - 2 if n >= 141 else 0)
     vavg = sma(V, P['vol_days'])
     adj = bars[t]['raw_close'] / C[t]                 # 還原價 → 實際價
     px = lambda v: round(v * adj, 2)
@@ -1246,10 +1332,9 @@ def cmd_scan(a):
                         '請先雙擊 setup.bat 並選擇「現在下載」，或在程式資料夾執行 python fetch_data.py backfill。')
     wl = load_list(o['list'])
     res = []
-    for code, path in files(a.data):
-        if wl is not None and code not in wl:
-            continue
-        name, bars = load_bars(path)
+    todo = [(code, path) for code, path in files(a.data) if wl is None or code in wl]
+    for (code, path), (_, raw) in zip(todo, prefetch([p for _, p in todo])):
+        name, bars = load_file(path, raw)
         r = analyze(code, (wl or {}).get(code) or name, bars)
         size(r, capital, risk)
         res.append(r)
@@ -1341,8 +1426,9 @@ def cmd_config(a):
 def cmd_pool(a):
     """自選股池：收盤在季線上，且布林剛擴張（帶寬比 5 日前擴大）、MACD 剛由負轉正或即將轉正。"""
     rows = []
-    for code, path in files(a.data):
-        name, bars = load_bars(path)
+    todo = list(files(a.data))
+    for (code, path), (_, raw) in zip(todo, prefetch([p for _, p in todo])):
+        name, bars = load_file(path, raw)
         if len(bars) < 80:
             continue
         C = [b['close'] for b in bars]

@@ -1536,5 +1536,197 @@ class TestRunBatWithoutPython(_SetupRunner):
         self.assertFalse(os.path.exists(self.pydl))
 
 
+# ---------- v1.1.4 掃描加速：結果必須和原本完全一樣 ----------
+STD8 = ['date', 'open', 'high', 'low', 'close', 'volume', 'raw_close', 'name']
+
+
+def rand_csv(rnd, n=None):
+    """隨機產生各種寫法的 csv（標準、欄序不同、FinMind 欄名、多欄、引號、BOM、各種換行、重複日期…）"""
+    n = n if n is not None else rnd.randint(0, 40)
+    head = rnd.choice([STD8, STD8, STD8, STD8[:6], STD8[:6] + ['name'], STD8 + ['x'],
+                       ['date', 'open', 'max', 'min', 'close', 'Trading_Volume'], STD8[:5] + ['volume', 'name', 'raw_close']])
+    day = dt.date(2026, 1, 1)
+    rows = []
+    bad = 0.02 if rnd.random() < 0.3 else 0.0                    # 約三成的檔案會有壞資料
+    for _ in range(n):
+        day += dt.timedelta(days=rnd.randint(0, 2))           # 0 = 重複日期
+        c = round(rnd.uniform(1, 500), rnd.randint(0, 4))
+        v = rnd.choice([0, 0.0, 1, 123456, 2.5e6, '0', '-0', '1e3'])
+
+        def num(x):
+            if rnd.random() < bad:
+                return rnd.choice(['', 'abc', '1,2'])
+            return rnd.choice([str(x)] * 6 + [' %s' % x, '%s ' % x, '%e' % x, '1_0'])
+        vals = dict(date=day.isoformat(), open=num(c), high=num(c * 1.01), max=num(c * 1.01), low=num(c * 0.99),
+                    min=num(c * 0.99), close=rnd.choice([num(c)] * 10 + ['0', 'nan', 'inf']), volume=str(v),
+                    Trading_Volume=str(v), raw_close=rnd.choice([str(c * 1.1), '', str(c), num(c)]),
+                    name=rnd.choice(['台泥', '', 'A B', '名 稱'] + (['台,泥'] if bad else [])), x='y')
+        f = [vals[h] for h in head]
+        if rnd.random() < bad:
+            f = f[:rnd.randint(0, len(f))]                      # 欄數不對
+        rows.append(f)
+    q = rnd.random() < 0.1
+    cell = lambda s: '"%s"' % s if q or ',' in s else s
+    lines = [','.join(head)] + [','.join(cell(s) for s in r) for r in rows]
+    if rnd.random() < 0.1:
+        lines.insert(rnd.randint(1, len(lines)), '')            # 空白行
+    nl = rnd.choice(['\r\n', '\r\n', '\n', '\r'])
+    text = nl.join(lines) + rnd.choice([nl, ''])
+    raw = text.encode('utf-8')
+    if rnd.random() < 0.3:
+        raw = b'\xef\xbb\xbf' + raw
+    if bad and rnd.random() < 0.1 and len(raw) > 60:
+        raw = raw[:50] + b'\xff' + raw[50:]                     # 編碼錯誤
+    return raw
+
+
+def outcome(fn, *a):
+    """回傳結果或例外的 repr（nan != nan，所以比 repr）"""
+    try:
+        return repr(('ok', fn(*a)))
+    except Exception as e:      # noqa: BLE001
+        return repr(('err', type(e).__name__, str(e)))
+
+
+class TestFastScan(TempCase):
+    def test_fast_loader_equals_load_bars_random(self):
+        rnd = __import__('random').Random(20261026)
+        fast = 0
+        for i in range(600):
+            p = write(os.path.join(self.tmp, '%04d.csv' % i), rand_csv(rnd))
+            raw = readb(p)
+            want = outcome(screener.load_bars, p)
+            self.assertEqual(outcome(screener.load_file, p, raw), want, p)
+            self.assertEqual(outcome(screener.load_file, p, None), want, p)
+            try:
+                fast += screener._parse_fast(raw) is not None
+            except Exception:       # noqa: BLE001
+                pass
+        self.assertTrue(100 < fast < 500, fast)     # 快速路徑與退回 load_bars 兩邊都有測到
+
+    def test_fast_path_used_for_standard_files(self):
+        d = os.path.join(self.tmp, 'data')
+        make_data(d, n=150)
+        p = os.path.join(d, '1101.csv')
+        with mock.patch.object(screener, 'load_bars', wraps=screener.load_bars) as lb:
+            got = screener.load_file(p, readb(p))
+        lb.assert_not_called()
+        self.assertEqual(got, screener.load_bars(p))
+        self.assertEqual(len(got[1]), 150)
+
+    def test_fallback_triggers(self):
+        good = 'date,open,high,low,close,volume,raw_close,name\r\n2026-01-02,1,2,0.5,1.5,100,1.6,台泥\r\n'
+        cases = dict(
+            quote=good.replace('台泥', '"台泥"'), header=good.replace('raw_close,name', 'name,raw_close'),
+            alias=good.replace('high,low', 'max,min'), extra=good.replace('name\r\n', 'name,x\r\n'),
+            short=good + '2026-01-03,1,2\r\n', cr=good.replace('\r\n', '\r'), nul=good.replace('台泥', '台\x00泥'),
+            badnum=good.replace(',1,2,', ',x,2,'), emptyclose=good.replace(',1.5,', ',,'),
+            longline=good + '2026-01-03,1,2,0.5,1.5,100,1.6,' + 'x' * 140000 + '\r\n')
+        for name, text in cases.items():
+            p = write(os.path.join(self.tmp, name + '.csv'), text)
+            with mock.patch.object(screener, 'load_bars', wraps=screener.load_bars) as lb:
+                got = outcome(screener.load_file, p, readb(p))
+            lb.assert_called_once_with(p)
+            self.assertEqual(got, outcome(screener.load_bars, p), name)
+        p = write(os.path.join(self.tmp, 'bad.csv'), good.encode('utf-8') + b'\xff')
+        with mock.patch.object(screener, 'load_bars', wraps=screener.load_bars) as lb:
+            got = outcome(screener.load_file, p, readb(p))
+        lb.assert_called_once_with(p)
+        self.assertTrue(got.startswith("('err', 'UnicodeDecodeError'"), got)
+        self.assertEqual(got, outcome(screener.load_bars, p))
+        j = write(os.path.join(self.tmp, '9999.json'), json.dumps(dict(name='J', bars=[
+            dict(date='2026-01-02', open=1, high=2, low=0.5, close=1.5, volume=100)])))
+        self.assertIsNone(screener._read_raw(j))
+        with mock.patch.object(screener, 'load_bars', wraps=screener.load_bars) as lb:
+            self.assertEqual(screener.load_file(j, readb(j)), screener.load_bars(j))
+        lb.assert_called_with(j)
+        self.assertIsNone(screener._read_raw(os.path.join(self.tmp, 'nope.csv')))
+
+    def test_boll_tail_matches_full(self):
+        rnd = __import__('random').Random(7)
+        xs = [rnd.uniform(10, 20) for _ in range(300)]
+        full = screener.boll(xs)
+        for s in (0, 5, 19, 20, 178, 299, 300):
+            part = screener.boll(xs, start=s)
+            self.assertEqual(part[0], full[0])
+            for a, b in zip(part[1:], full[1:]):
+                self.assertEqual(a[s:], b[s:])
+                self.assertEqual(a[:s], [None] * min(s, len(xs)))
+
+    def test_analyze_same_as_full_boll(self):
+        rnd = __import__('random').Random(11)
+        orig = screener.boll
+        full = lambda xs, n=20, k=2, start=0: orig(xs, n, k)
+        typed = 0
+        for n in (79, 80, 81, 100, 121, 122, 123, 140, 141, 142, 143, 200, 260):
+            for seed in range(12):
+                d = dt.date(2025, 1, 6)
+                bars, c = [], rnd.uniform(20, 200)
+                for i in range(n):
+                    flat = i < n - 3 and rnd.random() < 0.7
+                    o = c * (1 + rnd.uniform(-0.004, 0.004) if flat else 1 + rnd.uniform(-0.02, 0.02))
+                    c = o * (1 + (rnd.uniform(-0.004, 0.005) if flat else rnd.uniform(-0.03, 0.06)))
+                    if i >= n - 2 and rnd.random() < 0.5:
+                        c = o * 1.06                              # 長紅 K
+                    v = rnd.randint(1000, 5000) * (4 if i >= n - 2 and rnd.random() < 0.5 else 1)
+                    bars.append(dict(date=(d + dt.timedelta(days=i)).isoformat(), open=o, high=max(o, c) * 1.005,
+                                     low=min(o, c) * 0.995, close=c, raw_close=c, volume=v))
+                got = screener.analyze('x', 'n', bars)
+                with mock.patch.object(screener, 'boll', full):
+                    want = screener.analyze('x', 'n', bars)
+                self.assertEqual(got, want, (n, seed))
+                typed += bool(got.get('type'))
+        self.assertGreater(typed, 0)
+
+    def test_prefetch_keeps_order(self):
+        rnd = __import__('random').Random(3)
+        paths = ['f%03d.csv' % i for i in range(200)] + ['g.json']
+        real = screener._read_raw
+
+        def slow(p):
+            time.sleep(rnd.random() * 0.002)
+            return None if p.endswith('.json') else p.encode()
+        with mock.patch.object(screener, '_read_raw', slow):
+            got = list(screener.prefetch(paths, workers=8))
+        self.assertEqual([p for p, _ in got], paths)
+        self.assertEqual([r for _, r in got], [p.encode() for p in paths[:-1]] + [None])
+        self.assertEqual(list(screener.prefetch([])), [])
+        self.assertIs(screener._read_raw, real)
+        self.assertTrue(4 <= screener.read_workers() <= 16)
+
+    def scan_json(self, d, **kw):
+        out = os.path.join(self.tmp, 'r%d.json' % len(os.listdir(self.tmp)))
+        a = argparse.Namespace(data=d, config=None, list=None, capital=1000000, risk=None, out=out + '.md', json=out,
+                               txt=None, html=None, csv=None, out_dir=None, open=False)
+        quiet(screener.cmd_scan, a)
+        return readb(out)
+
+    def test_scan_output_independent_of_threads(self):
+        d = os.path.join(self.tmp, 'data')
+        make_data(d, codes=tuple(str(1100 + i) for i in range(40)), n=160)
+        write(os.path.join(d, '9001.csv'), 'date,open,max,min,close,Trading_Volume\n2026-01-02,1,2,0.5,1.5,100\n')
+        base = self.scan_json(d)
+        with mock.patch.object(screener, 'read_workers', lambda: 1):
+            self.assertEqual(self.scan_json(d), base)
+        orig = screener.boll
+        with mock.patch.object(screener, 'load_file', lambda p, raw=None: screener.load_bars(p)), \
+                mock.patch.object(screener, 'boll', lambda xs, n=20, k=2, start=0: orig(xs, n, k)):
+            self.assertEqual(self.scan_json(d), base)        # 舊做法：逐檔 load_bars、布林全部算
+        codes = [r['code'] for r in json.loads(base)]
+        self.assertEqual(codes, sorted(codes))
+
+    def test_scan_unreadable_file_same_error(self):
+        d = os.path.join(self.tmp, 'data')
+        make_data(d)
+        bad = write(os.path.join(d, '2000.csv'), 'date,open,high,low,close,volume\r\n'.encode() + b'\xff\r\n')
+        with self.assertRaises(UnicodeDecodeError) as cm:
+            screener.load_bars(bad)
+        want = (type(cm.exception).__name__, str(cm.exception))
+        r = subprocess.run([sys.executable, os.path.join(ROOT, 'screener.py'), 'scan', '--data', d],
+                           cwd=self.tmp, env=clean_env(PYTHONUTF8='1'), capture_output=True, timeout=120)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('程式發生未預期的錯誤：%s: %s' % want, r.stderr.decode('utf-8'))
+
+
 if __name__ == '__main__':
     unittest.main()
