@@ -68,6 +68,24 @@ call :msg STEP2
 :scan_done
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :fail
+if not exist "%F_CFG%" goto :alldone
+set "SHARE_ASK=--ask"
+if defined TWSTOCK_NOPAUSE set "SHARE_ASK="
+%PYCMD% screener.py share --config "%F_CFG%" --publish %SHARE_ASK%
+set "RC=%ERRORLEVEL%"
+call :msgl LOGSHARE
+if "%RC%"=="0" goto :alldone
+if "%RC%"=="10" goto :share_wait
+echo(
+call :msg SHARE_FAIL
+goto :end
+:share_wait
+echo(
+call :msg SHARE_WAIT
+set "RC=0"
+set "KEEPOPEN=1"
+goto :end
+:alldone
 echo(
 call :msg DONE
 goto :end
@@ -89,6 +107,7 @@ goto :end
 :end
 if defined TWSTOCK_NOPAUSE goto :done
 if not "%RC%"=="0" goto :dopause
+if defined KEEPOPEN goto :dopause
 echo(
 call :msg CLOSE
 timeout /t 15
@@ -197,4 +216,9 @@ rem ===== messages below are data read by :msg and :msgv; cmd never executes the
 ::FAILLOG| 紀錄檔：!LOG!
 ::FAILBAR|============================================================
 ::LOGFAIL|失敗 代碼 !RC!
+::LOGSHARE|分享版公開步驟結束 代碼 !RC!
+::SHARE_WAIT|選股已經完成，結果頁也打開了。分享版還沒有公開：第一次公開需要你確認（說明在上面）。
+::SHARE_WAIT|不想公開的話，把 設定.txt 的 share_publish 改成 0。
+::SHARE_FAIL|選股已經完成，結果頁也打開了；只有「公開分享版」沒有完成（代碼 !RC!）。
+::SHARE_FAIL|原因和建議做法在上面「原因：」「怎麼做：」；今天的選股結果不受影響。
 ::CLOSE|這個視窗 15 秒後會自動關閉（按任意鍵可以馬上關閉）。

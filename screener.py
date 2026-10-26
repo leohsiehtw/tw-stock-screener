@@ -3,17 +3,22 @@
 用法：
   python3 screener.py scan --data DIR [--config 設定.txt] [--list 自選股.csv] [--capital 1000000] [--risk 0.02]
                            [--out 結果.md] [--json 結果.json] [--txt 推播.txt]
-                           [--html 結果.html] [--csv 結果.csv] [--out-dir 結果資料夾] [--open]
+                           [--html 結果.html] [--csv 結果.csv] [--out-dir 結果資料夾] [--open] [--share]
   python3 screener.py pool --data DIR [--out 自選股候選.csv]
   python3 screener.py add  --data DIR --bars 今日.csv
   python3 screener.py config --show 設定.txt | --write 設定.txt | --check {capital,risk,mode} | --check-watchlist 自選股.csv
                            （給 setup.bat 用；--write 讀環境變數 IN_CAPITAL、IN_RISK、IN_MODE）
+  python3 screener.py share --config 設定.txt (--publish [--ask] | --confirm-first-publish 帳號/儲存庫 | --takedown [帳號/儲存庫])
+                           （選用：把分享版公開到 GitHub Pages，或下架；細節見 README「分享給別人看」）
 
 選項優先順序：命令列 > 設定.txt（--config）> 預設值。--out-dir 或設定檔的 output_dir 會一次產生
-盤後選股_<日期>.html/.csv/.md/.txt/.json。
+盤後選股_<日期>.html/.csv/.md/.txt/.json。--share（或設定檔 share=1）另外產生 分享版_<日期>.html
+（只含候選標的，通過安全檢查才會寫出）。
 
 結束代碼：0 成功；6 找不到股價資料；7 自選股清單有問題；8 檔案或視窗的文字編碼不對；
 9 設定檔有問題；1 程式發生未預期的錯誤。
+10～15 只會出現在 share 公開這一步，選股結果不受影響：10 等你確認第一次公開；11 找不到 gh；12 gh 沒登入；
+13 分享版沒有通過安全檢查或沒有產生；14 GitHub 那邊出錯；15 設定或儲存庫不符合條件。
 
 add：把每天收盤的一根 K 棒併進 DIR（今日.csv 欄位 code,date,open,high,low,close,volume），
      免得每天重抓一整年。除權息後還原價會變，該檔要重抓整段歷史覆蓋。
@@ -203,7 +208,7 @@ def fail(code, cause, todo):
     sys.exit(code)
 
 
-def read_text(path, what):
+def read_text(path, what, quiet=False):
     """讀使用者編輯的文字檔：UTF-8（有無 BOM 都可）優先，其次 Big5（附警告）；UTF-16 或都不行就報編碼錯誤"""
     with open(path, 'rb') as f:
         raw = f.read()
@@ -218,12 +223,13 @@ def read_text(path, what):
         text = raw.decode('cp950')
     except UnicodeDecodeError:
         raise bad
-    say(f'注意：{what}「{os.path.basename(path)}」是 Big5（ANSI）編碼，已經自動讀取；建議用記事本另存成 UTF-8。')
+    if not quiet:
+        say(f'注意：{what}「{os.path.basename(path)}」是 Big5（ANSI）編碼，已經自動讀取；建議用記事本另存成 UTF-8。')
     return text
 
 
 # ---------- 設定檔 ----------
-CONFIG_KEYS = ('capital', 'risk', 'mode', 'watchlist', 'output_dir')
+CONFIG_KEYS = ('capital', 'risk', 'mode', 'watchlist', 'output_dir', 'share', 'share_publish', 'share_repo')
 
 
 def _unquote(v):
@@ -274,6 +280,29 @@ def parse_mode(v):
     raise ValueError('模式只能寫 full（全市場）或 watchlist（自選股）')
 
 
+def parse_onoff(v):
+    s = _unquote(v).strip().lower()
+    if s == '':
+        return False
+    if s in ('1', 'y', 'yes', 'true', 'on', '是', '開'):
+        return True
+    if s in ('0', 'n', 'no', 'false', 'off', '否', '關'):
+        return False
+    raise ValueError('只能寫 1（開）或 0（關）')
+
+
+REPO_RE = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}/[A-Za-z0-9._-]{1,100}')
+
+
+def parse_repo(v):
+    s = _unquote(v).strip()
+    if s == '':
+        return None
+    if not REPO_RE.fullmatch(s) or s.split('/', 1)[1] in ('.', '..') or s.lower().endswith('.git'):
+        raise ValueError('要寫成「GitHub 帳號/儲存庫名稱」，例如 yourname/tw-stock-screener-results（只能用英文字母、數字和 - . _）')
+    return s
+
+
 def _cfg_path(v, base):
     v = os.path.expandvars(v)
     return os.path.abspath(v if os.path.isabs(v) else os.path.join(base, v))
@@ -307,7 +336,8 @@ def load_config(path):
             continue
         got[k] = (n, line, v)
     cfg = dict(capital=None, risk=0.02, mode='full', path=os.path.abspath(path),
-               watchlist=_cfg_path('自選股.csv', base), output_dir=_cfg_path('結果', base))
+               watchlist=_cfg_path('自選股.csv', base), output_dir=_cfg_path('結果', base),
+               share=False, share_publish=False, share_repo=None)
     for k, (n, line, v) in got.items():
         if v == '':
             continue
@@ -318,6 +348,10 @@ def load_config(path):
                 cfg[k] = parse_risk(v)
             elif k == 'mode':
                 cfg[k] = parse_mode(v)
+            elif k in ('share', 'share_publish'):
+                cfg[k] = parse_onoff(v)
+            elif k == 'share_repo':
+                cfg[k] = parse_repo(v)
             else:
                 cfg[k] = _cfg_path(v, base)
         except ValueError as e:
@@ -328,8 +362,13 @@ def load_config(path):
 def describe_config(cfg):
     cap = '%s 元' % format(cfg['capital'], ',') if cfg['capital'] else '不設定（不試算部位）'
     scope = '全市場' if cfg['mode'] == 'full' else '自選股清單（%s）' % cfg['watchlist']
-    return [f'總資金：{cap}', f'每筆風險：{format(cfg["risk"] * 100, "g")}%', f'範圍：{scope}',
-            f'結果存放：{cfg["output_dir"]}']
+    out = [f'總資金：{cap}', f'每筆風險：{format(cfg["risk"] * 100, "g")}%', f'範圍：{scope}',
+           f'結果存放：{cfg["output_dir"]}']
+    if cfg.get('share') or cfg.get('share_publish'):
+        out.append('分享版：每次選股會另外產生 分享版_日期.html（只含候選標的）')
+    if cfg.get('share_publish'):
+        out.append('公開分享版：開（%s）；第一次公開要你自己確認' % (cfg.get('share_repo') or '還沒有填 share_repo'))
+    return out
 
 
 def write_config(path, capital, risk, mode):
@@ -362,12 +401,12 @@ def write_config(path, capital, risk, mode):
     os.replace(tmp, path)
 
 
-def load_list(path):
+def load_list(path, quiet=False):
     if not path:
         return None
     base = os.path.basename(path)
     try:
-        text = read_text(path, '自選股清單')
+        text = read_text(path, '自選股清單', quiet)
     except FileNotFoundError:
         if os.path.exists(path + '.txt'):
             todo = f'找到「{base}.txt」，請把檔名改成「{base}」（Windows 可能隱藏了副檔名）。'
@@ -1081,7 +1120,7 @@ def _sec_summary(B, ctx):
     B.append('</div></header>')
 
 
-def _sec_cands(B, ctx, capital, risk_txt, risk):
+def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台積'):
     h = html.escape
     cands = ctx['cands']
     B.append('<section class="band" id="cands" aria-labelledby="cands-h"><div class="wrap stack">')
@@ -1098,7 +1137,7 @@ def _sec_cands(B, ctx, capital, risk_txt, risk):
     B.append('<div class="tools needs-js">'
              + _seg('ft', '型態', [('all', '全部 %d' % len(cands)), ('突破型', '突破型 %d' % nb), ('回測型', '回測型 %d' % (len(cands) - nb))])
              + _seg('fk', '類別', [('all', '全部 %d' % len(cands)), ('stock', '個股 %d' % (len(cands) - ne)), ('etf', 'ETF %d' % ne)])
-             + '<label class="fld" for="cq">搜尋代號或名稱<input type="search" id="cq" autocomplete="off" placeholder="例如 2330 或 台積"></label>'
+             + '<label class="fld" for="cq">搜尋代號或名稱<input type="search" id="cq" autocomplete="off" placeholder="%s"></label>' % _a(placeholder)
              + '<label class="fld" for="csort">排序<select id="csort">'
              + ''.join('<option value="%s">%s</option>' % (_a(v), h(t)) for v, t in sorts)
              + '</select></label></div>'
@@ -1231,6 +1270,11 @@ def _sec_help(B, ctx):
 </div></section>''')
 
 
+def _topnav(date):
+    return ('<div class="topnav"><div class="wrap"><span class="brand">台股盤後選股</span>'
+            '<span class="navdate">資料日期 %s</span></div></div>' % html.escape(date + _dow(date)))
+
+
 def render_html(res, list_mode, meta):
     """產生單一 HTML 檔（不連外部資源）。不會修改 res。
 
@@ -1251,8 +1295,7 @@ def render_html(res, list_mode, meta):
                wname='自選股觀察' if list_mode else '觀察名單',
                wtitle='自選股：過第 2、3 關但型態未到' if list_mode else '觀察名單',
                pos=('總資金 %s 元、每筆風險 %s%%' % (format(int(capital), ','), risk_txt)) if capital else '未設定總資金，不試算部位')
-    B = ['<div class="topnav"><div class="wrap"><span class="brand">台股盤後選股</span>'
-         '<span class="navdate">資料日期 %s</span></div></div><main>' % h(date + _dow(date))]
+    B = [_topnav(date) + '<main>']
     _sec_summary(B, ctx)
     _sec_cands(B, ctx, capital, risk_txt, risk)
     _sec_watch(B, ctx, list_mode)
@@ -1261,6 +1304,119 @@ def render_html(res, list_mode, meta):
     B.append('</main><footer><div class="wrap"><p class="fine">產生時間 %s｜僅供研究，非投資建議。</p>'
              '</div></footer>' % h(str(meta.get('generated') or '')))
     return HTML_HEAD.replace('@@TITLE@@', h(title)) + '\n'.join(B) + '\n' + HTML_TAIL
+
+
+# ---------- 分享版（只含候選標的；可選擇公開到 GitHub Pages） ----------
+# 只複製這幾個欄位：新增欄位不會自動出現在分享版裡（寧可少放，不要多放）
+SHARE_FIELDS = ('code', 'name', 'type', 'close', 'chg', 'vol_ratio', 'stop', 'setup', 'stop_why')
+SHARE_MA = ('ma20', 'boll_up', 'boll_lo')
+SHARE_CODE_RE = re.compile(r'[0-9]{4}[0-9A-Z]{0,2}')
+SHARE_HEAD = HTML_HEAD.replace('<title>', '<meta name="robots" content="noindex, nofollow">\n<title>', 1)
+_cut = HTML_JS.index('\n  // 觀察名單\n')
+# 只留「候選標的」的那一段（排序、篩選、搜尋）；整行註解拿掉
+SHARE_JS = '\n'.join(x for x in HTML_JS[:_cut].split('\n') if not x.lstrip().startswith('//')) + '\n})();\n'
+
+
+def _isnum(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _share_text(v, label, limit):
+    if not isinstance(v, str) or len(v) > limit or any(ord(c) < 32 or ord(c) == 127 for c in v):
+        raise ValueError('分享版：「%s」的內容不合規則' % label)
+    return v
+
+
+def share_rows(res):
+    """只取候選標的、只複製 SHARE_FIELDS（和 ma 的三個價位）；資料有任何不合規則的地方就丟 ValueError"""
+    rows = []
+    for r in res:
+        if 'error' in r or not r.get('type'):
+            continue
+        try:
+            row = {k: r[k] for k in SHARE_FIELDS}
+        except KeyError as e:
+            raise ValueError('分享版：候選標的缺少欄位 %s' % e.args[0])
+        if not isinstance(row['code'], str) or not SHARE_CODE_RE.fullmatch(row['code']):
+            raise ValueError('分享版：有股票代號的格式不對')
+        if row['type'] not in ('突破型', '回測型'):
+            raise ValueError('分享版：有型態不是突破型或回測型')
+        _share_text(row['name'], '名稱', 60)
+        _share_text(row['setup'], '說明', 300)
+        _share_text(row['stop_why'], '停損依據', 300)
+        for k in ('close', 'chg', 'vol_ratio', 'stop'):
+            if not _isnum(row[k]):
+                raise ValueError('分享版：「%s」不是有效的數字' % k)
+        if row['close'] <= 0 or row['stop'] <= 0:
+            raise ValueError('分享版：收盤或停損不是正數')
+        ma = {}
+        for k in SHARE_MA:
+            v = (r.get('ma') or {}).get(k)
+            if v is None:
+                continue
+            if not _isnum(v):
+                raise ValueError('分享版：「%s」不是有效的數字' % k)
+            ma[k] = v
+        row['ma'] = ma
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r['type'], -r['vol_ratio'], r['code']))     # 代號放最後，輸入順序不同也產生同樣的頁面
+
+
+def _share_help():
+    return """<section class="band alt" id="help" aria-labelledby="help-h"><div class="wrap stack help">
+<h2 id="help-h">怎麼看這一頁</h2>
+<h3>關卡說明</h3><ul>
+<li>第 0 關 週線：週 MACD 在零軸上（或柱狀體剛翻紅），收盤在週 MA13、MA26 之上，週線不是空頭排列。</li>
+<li>第 1 關 趨勢：收盤在 MA60 之上，MA20 在 MA60 之上，MA20 不下彎、MA60 上彎。</li>
+<li>第 2 關 動能：日 OSC 今天由負翻正；或 3 日內 DIF 上穿 DEA，而且今天的柱狀體比昨天大。</li>
+<li>第 3 關 量能：今天的量大於前 5 日均量的 1.3 倍，而且收紅。</li>
+<li>第 4 關 型態：突破型要過第 0～3 關，是整理或布林縮口之後，帶量長紅 K 收在布林上軌之上；回測型要過第 0～1 關，是沿月線爬升、量縮回測 MA20 附近止跌。</li>
+<li>建議停損：突破型取長紅 K 低點與 MA20 中較高的一個；回測型取 MA20 與當日低點中較低的一個。</li>
+</ul>
+<h3>怎麼看這一頁</h3><ul>
+<li>最上面是摘要：資料日期、掃描檔數，以及候選標的有幾檔突破型和回測型。</li>
+<li>候選標的可以用「型態」「類別」（00 開頭的代號算 ETF）篩選，也可以搜尋代號或名稱；用「排序」選單或點表格欄位名稱排序，再點一次反過來排。</li>
+<li>型態：<span class="tag t-break">突破型</span> 整理後帶量長紅突破；<span class="tag t-pull">回測型</span> 沿月線上行、量縮回測月線止跌。</li>
+<li>漲跌%：依台灣習慣，<span class="up">▲ 紅色是上漲</span>、<span class="down">▼ 綠色是下跌</span>，也都會寫正負號。</li>
+<li>停損距離：<span class="d-ok">近</span> 3% 以內，停損很近；<span class="d-mid">中</span> 3%～6%，普通；<span class="d-wide">遠</span> 超過 6%，停損很遠，一旦停損虧損會偏大。</li>
+<li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
+<li>頁面會跟著電腦或手機的淺色／深色設定切換；手機上表格會改成一張一張的卡片。</li>
+</ul>
+<p class="cap14">本頁僅供程式與技術分析研究，不是投資建議，也不保證任何績效。資料可能延遲、缺漏或有誤，請以交易所公告為準。投資決定與後果由使用者自行承擔。</p>
+</div></section>"""
+
+
+def render_share_html(res):
+    """分享版：只有今天的候選標的與關卡說明。不收任何 meta（總資金、路徑、產生時間…），同樣的資料一定產生同樣的位元組。
+    不會修改 res；資料有不合規則的地方丟 ValueError。"""
+    h = html.escape
+    cands = share_rows(res)
+    ok = [r for r in res if 'error' not in r]
+    dates = [r['date'] for r in ok]
+    if not dates or any(not isinstance(d, str) or not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', d) for d in dates):
+        raise ValueError('分享版：沒有有效的資料日期')
+    date = max(dates)
+    try:
+        dt.date.fromisoformat(date)
+    except ValueError:
+        raise ValueError('分享版：資料日期不是有效的日期')
+    nb = sum(1 for r in cands if r['type'] == '突破型')
+    ctx = dict(cands=cands)
+    B = [_topnav(date) + '<main>']
+    B.append('<header class="band alt" id="top"><div class="wrap stack">')
+    B.append('<div class="stack" style="gap:8px"><h1><span class="nw">台股盤後選股</span> <span class="nw">%s</span></h1><p class="sub">%s</p></div>' % (
+        h(date + _dow(date)), h('收盤資料｜全市場掃描 %d 檔（資料有效 %d 檔）' % (len(res), len(ok)))))
+    B.append('<dl class="stats">'
+             '<div><dt>候選標的</dt><dd>%d<small>檔</small></dd></div>'
+             '<div><dt>突破型</dt><dd>%d<small>檔</small></dd></div>'
+             '<div><dt>回測型</dt><dd>%d<small>檔</small></dd></div></dl>' % (len(cands), nb, len(cands) - nb))
+    B.append('<p class="cap14">分享版：只列出今天的候選標的與關卡說明。僅供研究，非投資建議。</p>')
+    B.append('<nav class="jump" aria-label="本頁段落"><a href="#cands">候選標的</a><a href="#help">怎麼看這一頁</a></nav>')
+    B.append('</div></header>')
+    _sec_cands(B, ctx, None, '', 0.02, placeholder='輸入代號或名稱')
+    B.append(_share_help())
+    B.append('</main><footer><div class="wrap"><p class="fine">資料日期 %s｜僅供研究，非投資建議。</p></div></footer>' % h(date))
+    return SHARE_HEAD.replace('@@TITLE@@', h('台股盤後選股 %s%s' % (date, _dow(date)))) + '\n'.join(B) + '\n<script>' + SHARE_JS + '</script>\n</body>\n</html>\n'
 
 
 CSV_HEAD = ['代號', '名稱', '資料日期', '型態', '收盤', '漲跌%', '量比', '建議停損', '停損距離%', '股數(設定風險)', '金額(設定風險)',
@@ -1308,7 +1464,8 @@ def resolve_scan_options(a):
     if wl is None and cfg and cfg['mode'] == 'watchlist':
         wl = cfg['watchlist']
     out_dir = a.out_dir or (cfg['output_dir'] if cfg else None)
-    return dict(capital=capital, risk=risk, list=wl, out_dir=out_dir)
+    share = bool(getattr(a, 'share', False) or (cfg and (cfg['share'] or cfg['share_publish'])))
+    return dict(capital=capital, risk=risk, list=wl, out_dir=out_dir, share=share, cfg=cfg)
 
 
 def open_file(path):
@@ -1322,6 +1479,64 @@ def open_file(path):
             webbrowser.open(pathlib.Path(path).resolve().as_uri())
     except OSError as e:
         say(f'無法自動打開瀏覽器（{e}），請自己雙擊打開：{os.path.abspath(path)}')
+
+
+SHARE_STATE = os.path.join(HERE, 'cache', 'share', 'state.json')
+
+
+def _share_rules(share, cfg, capital, amounts, data_dir, out_dir, list_path=None):
+    """分享版安全檢查的規則：總資金、部位試算金額、自選股清單、本機路徑、帳號名稱都不可以出現在分享版裡"""
+    import tempfile
+    paths = [HERE, os.path.expanduser('~'), os.getcwd(), tempfile.gettempdir()]
+    paths += [os.path.abspath(p) for p in (data_dir, out_dir) if p]
+    if cfg:
+        paths += [os.path.dirname(cfg['path']), cfg['path']]
+    wl = {}
+    for p in (cfg['watchlist'] if cfg else None, os.path.join(HERE, '自選股.csv'), os.path.join(os.getcwd(), '自選股.csv'), list_path):
+        if p and os.path.isfile(p):
+            try:
+                wl.update(load_list(p, quiet=True))
+            except Exception:
+                pass
+    return share.make_rules(capital=capital, amounts=amounts, paths=paths, watchlist=wl,
+                            repo=cfg['share_repo'] if cfg else None)
+
+
+def build_share_page(res, o, a, tag, wl):
+    """產生分享版並做安全檢查，通過才寫檔（回傳路徑）。不能產生或沒通過：不寫檔、刪掉同一天舊的分享版、
+    印出原因，回傳 None。不影響選股結果。"""
+    out_dir = o['out_dir']
+    if wl is not None:
+        say('注意：分享版只支援全市場（mode=full），自選股清單模式不會產生分享版。')
+        return None
+    if not out_dir or not os.path.isdir(out_dir):
+        say('注意：沒有結果資料夾（--out-dir 或設定檔的 output_dir），所以沒有產生分享版。')
+        return None
+    path = os.path.join(out_dir, f'分享版_{tag}.html')
+    try:
+        import share
+        data = render_share_html(res).encode('utf-8')
+        amounts = [v for r in res for s in (r.get('size') or []) for v in (s['shares'], s['amount'])]
+        rules = _share_rules(share, o['cfg'], o['capital'], amounts, a.data, out_dir, o['list'])
+        problems = share.check_html(data, rules)
+    except Exception as e:
+        problems = ['%s' % (e if isinstance(e, ValueError) else '%s: %s' % (type(e).__name__, e))]
+    if problems:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        say('注意：分享版沒有產生（安全檢查沒有通過），選股結果不受影響。原因：')
+        for p in problems[:6]:
+            say('  - ' + p)
+        if len(problems) > 6:
+            say('  - 還有 %d 項' % (len(problems) - 6))
+        return None
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
 
 
 def cmd_scan(a):
@@ -1374,11 +1589,12 @@ def cmd_scan(a):
             f.write(render_html(res, wl is not None, meta))
     if csv_path:
         write_csv(csv_path, res, capital)
+    share_path = build_share_page(res, o, a, tag, wl) if o['share'] else None
     if not md_path:
         sys.stdout.write(md)
     if any((html_path, csv_path, md_path, txt_path, json_path)):
         say(f'選股完成：掃描 {len(res)} 檔，候選 {sum(1 for r in res if r.get("type"))} 檔。')
-        for label, p in (('網頁報告', html_path), ('Excel 表格', csv_path), ('文字報告', md_path)):
+        for label, p in (('網頁報告', html_path), ('Excel 表格', csv_path), ('文字報告', md_path), ('分享版', share_path)):
             if p:
                 say(f'  {label}：{os.path.abspath(p)}')
     if a.open:
@@ -1386,6 +1602,38 @@ def cmd_scan(a):
             open_file(html_path)
         else:
             say('沒有產生 HTML（要加 --html 或 --out-dir），--open 略過。')
+
+
+def cmd_share(a):
+    """選用：把分享版公開到 GitHub Pages（--publish），或下架（--takedown）。沒開 share_publish 時什麼都不做。"""
+    import share
+    cfg = load_config(a.config)
+    token = a.confirm_first_publish
+    if token is not None:
+        try:
+            token = parse_repo(token) or ''
+        except ValueError as e:
+            raise UserError(share.E_SHARE, f'--confirm-first-publish 後面的寫法不對：{e}。', '例如 --confirm-first-publish yourname/tw-stock-screener-results')
+    try:
+        if a.takedown is not None:
+            repo = parse_repo(a.takedown) if a.takedown else (cfg['share_repo'] or share.load_state(SHARE_STATE).get('repo'))
+            return share.takedown(repo, SHARE_STATE, say)
+        if not cfg['share_publish']:
+            if token is not None:
+                raise UserError(share.E_SHARE, '設定檔的 share_publish 沒有打開，所以不會公開。', '在 設定.txt 把 share_publish 改成 1 後再執行。')
+            return 0
+        out_dir = cfg['output_dir']
+        amounts = []
+        _, tag, _ = share.latest_files(out_dir)
+        try:
+            with open(os.path.join(out_dir, f'盤後選股_{tag}.json'), encoding='utf-8') as f:
+                amounts = [v for r in json.load(f) for s in (r.get('size') or []) for v in (s['shares'], s['amount'])]
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass
+        rules = _share_rules(share, cfg, cfg['capital'], amounts, os.path.join(HERE, 'data'), out_dir)
+        return share.publish(cfg['share_repo'], cfg['mode'], out_dir, SHARE_STATE, rules, ask=a.ask, token=token, say=say)
+    except share.ShareError as e:
+        raise UserError(e.code, e.cause, e.todo)
 
 
 CHECK_HINT = dict(capital='請只打半形數字，例如 1000000；不想算部位就直接按 Enter。',
@@ -1489,7 +1737,16 @@ def main():
     s.add_argument('--csv')
     s.add_argument('--out-dir')
     s.add_argument('--open', action='store_true')
+    s.add_argument('--share', action='store_true')
     s.set_defaults(f=cmd_scan)
+    sh = sp.add_parser('share')
+    sh.add_argument('--config', required=True)
+    sg = sh.add_mutually_exclusive_group(required=True)
+    sg.add_argument('--publish', action='store_true')
+    sg.add_argument('--confirm-first-publish', metavar='帳號/儲存庫')
+    sg.add_argument('--takedown', nargs='?', const='', metavar='帳號/儲存庫')
+    sh.add_argument('--ask', action='store_true')
+    sh.set_defaults(f=cmd_share)
     c = sp.add_parser('config')
     g = c.add_mutually_exclusive_group(required=True)
     g.add_argument('--check', choices=('capital', 'risk', 'mode'))

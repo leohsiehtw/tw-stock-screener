@@ -31,3 +31,22 @@ watchlist=自選股.csv
 # 沒有寫完整路徑的話，是相對於這個設定檔所在的資料夾。
 # 也可以寫完整路徑，例如：output_dir=D:\選股結果
 output_dir=結果
+
+# ---------- 分享版（選用，預設全部關閉） ----------
+# 分享版是另一個檔案「分享版_日期.html」：只列出今天的候選標的與關卡說明，
+# 不含總資金、部位試算、自選股清單、各關明細、電腦上的路徑。結果資料夾裡的完整網頁（盤後選股_日期.html）
+# 含有你的總資金和自選股，請不要直接分享給別人。
+#
+# share=1：每次選股另外產生 分享版_日期.html（通過安全檢查才會產生）。只存在你的電腦裡，不會上傳。
+share=0
+
+# share_publish=1：選股完成後把分享版公開到 GitHub Pages（網址任何人都打得開）。
+#   公開有風險：被別人存檔、截圖、搜尋引擎收錄或轉貼後無法收回；請不要在股票名稱以外放個人資料。
+#   需要先安裝 GitHub CLI（gh）並執行 gh auth login 登入。
+#   第一次公開一定會先列出會上傳什麼，要你自己輸入 Y 確認；排程執行（run_daily.bat）永遠不會做第一次公開。
+#   下架：python screener.py share --config 設定.txt --takedown，然後把 share_publish 改回 0。
+share_publish=0
+
+# share_repo：要公開到的 GitHub 儲存庫，寫成 帳號/儲存庫名稱，例如 yourname/tw-stock-screener-results
+# 請準備一個專用的新儲存庫（裡面只會放 index.html 和 README.md 兩個檔案），帳號要和 gh 登入的帳號一樣。
+share_repo=
