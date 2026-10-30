@@ -280,7 +280,7 @@ class TestRender(unittest.TestCase):
         h = screener.render_html(fake_results(), True, meta_for())
         for bad in ('http://', 'https://', '<link', 'src=', '@import', 'url(', '<iframe', '<img', '//cdn'):
             self.assertNotIn(bad, h)
-        self.assertEqual(h.count('<script'), 2)            # 明細資料 + 頁面程式，都內嵌
+        self.assertEqual(h.count('<script'), 3)            # 主題（head）+ 明細資料 + 頁面程式，都內嵌
 
     def test_both_color_schemes_from_palette(self):
         h = screener.render_html(fake_results(), False, meta_for())
@@ -343,11 +343,13 @@ class TestRender(unittest.TestCase):
         self.assertIn('<details id="stages-det">', h)
         self.assertIn('<noscript>', h)
         self.assertIn('<tbody id="st-body"></tbody>', h)
-        self.assertEqual(h.count('</script>'), 2)
+        self.assertEqual(h.count('</script>'), 3)
         m = re.search(r'<script type="application/json" id="stage-data">(.*?)</script>', h)
-        rows = json.loads(m.group(1))
+        pack = json.loads(m.group(1))
+        rows = pack['r']
+        self.assertEqual(pack['s'], [''])
         self.assertEqual(len(rows), 7)
-        self.assertEqual(rows[0], ['1101', '台泥', '120.0', 0b011111, 2.4, '-0.5', '0.7'])
+        self.assertEqual(rows[0], ['1101', '台泥', '120.0', 0b011111, 2.4, '-0.5', '0.7', 0])
         self.assertEqual(rows[5][3], 0b000010)          # 1216：只過第 1 關
         self.assertEqual(rows[6][1], '</script><b>&')
         self.assertNotIn('1216', h.replace(m.group(0), ''))   # 明細列只在 JSON 裡，展開才產生
@@ -408,12 +410,13 @@ class TestCsv(TempCase):
         rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'), newline='')))
         self.assertEqual(rows[0], screener.CSV_HEAD)
         self.assertEqual(rows[0][:5], ['代號', '名稱', '資料日期', '型態', '收盤'])
-        self.assertEqual(rows[0][-3:], ['說明', '停損依據', '備註'])
+        self.assertEqual(rows[0][-4:], ['說明', '停損依據', '備註', '類股'])
         self.assertTrue(all(len(r) == len(rows[0]) for r in rows))
         codes = [r[0] for r in rows[1:]]
         self.assertIn('="0050"', codes)
         self.assertEqual(codes[-1], '="9999"')              # 錯誤列排最後
-        self.assertIn('資料只有 10 天', rows[-1][-1])
+        self.assertIn('資料只有 10 天', rows[-1][-2])
+        self.assertEqual(rows[-1][-1], '')
         self.assertEqual([bool(r[3]) for r in rows[1:]], [True] * 4 + [False] * 4)     # 候選在前，其餘在後，錯誤列最後
         first = rows[1]
         self.assertIn(first[13], ('是', '否'))
@@ -715,6 +718,11 @@ class FakeSite:
             f = ['代號', '名稱', '收盤', '開盤', '最高', '最低', '成交股數']
             return {'stat': 'ok', 'tables': [{'date': '%d/%s/%s' % (int(y) - 1911, m, d), 'fields': f,
                                               'data': [['6488', '環球晶', '10.5', '10', '11', '9', '1,000']]}]}
+        if 't187ap03' in u.path:
+            if u.path.endswith('_L'):
+                return [{'公司代號': '%04d' % (1101 + i), '公司簡稱': 'x', '產業別': '01'} for i in range(300)]
+            return [{'SecuritiesCompanyCode': '%04d' % (6001 + i), 'CompanyAbbreviation': 'y', 'SecuritiesIndustryCode': '24'}
+                    for i in range(300)]
         if 'TWT49U' in u.path:
             return {'stat': 'OK', 'fields': ['資料日期', '股票代號', '除權息前收盤價', '除權息參考價'],
                     'data': [['115年03月05日', '1101', '10', '9.5']]}
@@ -909,7 +917,7 @@ class TestNet(TempCase):
         site = FakeSite(holidays=('2025-03-19', '2025-03-14'))
         self.assertEqual(self.run_small(site), 0)
         # 密集 3/17~3/28 共 10 天、1 天休市：9*2+1；週線 3/3 週五 2 次；3/10 週五休市 1 次 + 週四 2 次；除權息 2 次
-        self.assertEqual(len(site.urls), 19 + 2 + 3 + 2)
+        self.assertEqual(len(site.urls), 19 + 2 + 3 + 2 + 2)       # + 類股資料（上市、上櫃各 1 次）
         self.assertEqual(sorted(site.days('MI_INDEX')).count('20250312'), 0)          # 週三不抓
         self.assertEqual(sorted(d for d in site.days('MI_INDEX') if d < '20250317'), ['20250307', '20250313', '20250314'])
         self.assertEqual(sorted(d for d in site.days('afterTrading/otc') if d < '20250317'), ['20250307', '20250313'])
@@ -956,7 +964,7 @@ class TestNet(TempCase):
         with mock.patch.object(fetch_data, '_open', site):
             self.assertEqual(fetch_data.cmd_backfill(a), 0)
         self.assertEqual(len(site.days('MI_INDEX')), 5)
-        self.assertEqual(len(site.urls), 5 * 2 + 2)
+        self.assertEqual(len(site.urls), 5 * 2 + 2 + 2)
 
     def test_progress_line_and_estimate(self):
         fake_clock(self)
@@ -1726,6 +1734,417 @@ class TestFastScan(TempCase):
                            cwd=self.tmp, env=clean_env(PYTHONUTF8='1'), capture_output=True, timeout=120)
         self.assertEqual(r.returncode, 1)
         self.assertIn('程式發生未預期的錯誤：%s: %s' % want, r.stderr.decode('utf-8'))
+
+
+# ---------- 類股（sector）與頁面顏色切換 ----------
+def sec_results(sectors):
+    """fake_results 加上類股：sectors = {代號: 標籤}；沒列到的給空字串"""
+    res = fake_results()
+    for r in res:
+        r['sector'] = sectors.get(r['code'], '')
+    return res
+
+
+class TestSectorTables(unittest.TestCase):
+    def test_trim_rules(self):
+        t = screener.trim_industry
+        for official, want in (('半導體業', '半導體'), ('水泥工業', '水泥'), ('其他業', '其他'), ('農業科技業', '農業科技'),
+                               ('綜合', '綜合'), ('工業', '工業'), ('業', '業'), ('電腦及週邊設備業', '電腦週邊'),
+                               ('觀光事業', '觀光餐旅'), ('觀光餐旅', '觀光餐旅'), ('其他電子業', '其他電子'), ('電機機械', '電機機械')):
+            self.assertEqual(t(official), want, official)
+
+    def test_label_rules(self):
+        import share
+        labels = list(screener.SECTOR_ORDER)
+        self.assertEqual(len(labels), len(set(labels)))
+        self.assertEqual(set(labels), set(screener.SECTOR_LABELS))
+        groups = {}
+        for l in labels:
+            self.assertTrue(share.SECTOR_RE.fullmatch(l), l)
+            self.assertIsNone(re.search(r'[0-9]', l), l)
+            self.assertEqual(share._nf(l), l)
+            for w in share.FORBIDDEN_WORDS:
+                self.assertNotIn(w, l)
+            groups.setdefault(l.split('-')[0], []).append(l)
+        for g, ls in groups.items():
+            if len(ls) > 1:
+                self.assertNotIn(g, labels, g)              # 大類名稱（篩選選單的值）不和任何標籤撞名
+        self.assertEqual(screener.SECTOR_BY_CODE['24'], '科技-半導體')
+        self.assertEqual(screener.SECTOR_BY_CODE['17'], '金融')
+        self.assertEqual(screener.SECTOR_BY_CODE['15'], '航運')
+        self.assertEqual(screener.SECTOR_BY_CODE['34'], '科技-電子商務')
+        self.assertEqual(screener.SECTOR_BY_CODE['32'], '傳產-文化創意')
+        self.assertEqual(screener.SECTOR_BY_CODE['16'], '傳產-觀光餐旅')
+
+    def test_sector_of(self):
+        rows = {'2330': '24', '2603': '15', '3293': '32', '1101': '水泥工業', '2882': '金融保險業', '5000': '99', '5001': '1',
+                '5002': '半導體業', '5003': '不存在的業'}
+        f = screener.sector_of
+        self.assertEqual(f('2330', '台積電', rows), '科技-半導體')
+        self.assertEqual(f('2603', '長榮', rows), '航運')
+        self.assertEqual(f('3293', '鈊象', rows), '傳產-文化創意')
+        self.assertEqual(f('1101', '台泥', rows), '傳產-水泥')
+        self.assertEqual(f('2882', '國泰金', rows), '金融')
+        self.assertEqual(f('5001', 'x', rows), '傳產-水泥')                        # 1 位數也認得
+        self.assertEqual(f('5002', 'x', rows), '科技-半導體')
+        for code in ('5000', '5003', '9999'):
+            self.assertEqual(f(code, 'x', rows), '', code)
+        self.assertEqual(f('2330', '台積電', {}), '')
+        self.assertEqual(f('2330', '台積電', None), '')
+        self.assertEqual(f('0050', '元大台灣50', {'0050': '24'}), 'ETF-市值型')       # ETF 不看快取
+
+    def test_etf_types(self):
+        want = {'00631L': ('元大台灣50正2', 'ETF-槓桿反向'), '00632R': ('元大台灣50反1', 'ETF-槓桿反向'),
+                '00719B': ('元大美債1-3', 'ETF-債券'), '00635U': ('期元大S&P黃金', 'ETF-商品期貨'),
+                '0056': ('元大高股息', 'ETF-高股息'), '00940': ('元大台灣價值高息', 'ETF-高股息'),
+                '0050': ('元大台灣50', 'ETF-市值型'), '00646': ('元大Ｓ＆Ｐ５００', 'ETF-市值型'),
+                '00916': ('國泰全球品牌', 'ETF-其他'), '00400A': ('主動國泰動能高息', 'ETF-高股息'),
+                '00679B': ('', 'ETF-債券'), '00xxx': (None, 'ETF-其他')}
+        for code, (name, label) in want.items():
+            self.assertEqual(screener.etf_type(code, name), label, code)
+            self.assertIn(label, screener.SECTOR_LABELS)
+
+
+class TestIndustryCache(TempCase):
+    def put(self, mkt, rows=None, **k):
+        d = os.path.join(self.tmp, 'cache', 'industry')
+        j = {'v': 1, 'rows': {'1101': '01'} if rows is None else rows, 'fetched': '2026-10-20', 'tried': '2026-10-20',
+             'stale': False, 'fails': 0}
+        j.update(k)
+        write(os.path.join(d, mkt + '.json'), json.dumps(j))
+        return d
+
+    def test_load_and_info(self):
+        d = os.path.join(self.tmp, 'cache', 'industry')
+        ind = screener.load_industry(d)
+        self.assertEqual((ind['have'], ind['rows']), (0, {}))
+        self.assertEqual(screener.sector_info(ind, '2026-10-22'), dict(status='none', fetched=''))
+        self.put('twse')
+        ind = screener.load_industry(d)                                           # 只有一邊
+        self.assertEqual(screener.sector_info(ind, '2026-10-22')['status'], 'stale')
+        self.put('tpex', rows={'6488': '24'}, fetched='2026-10-18')
+        ind = screener.load_industry(d)
+        self.assertEqual((ind['have'], ind['fetched'], sorted(ind['rows'])), (2, '2026-10-18', ['1101', '6488']))
+        self.assertEqual(screener.sector_info(ind, '2026-10-22'), dict(status='ok', fetched='2026-10-18'))
+        self.assertEqual(screener.sector_info(ind, '2026-11-01')['status'], 'ok')           # 剛好 14 天
+        self.assertEqual(screener.sector_info(ind, '2026-11-02')['status'], 'stale')        # 15 天
+        self.assertEqual(screener.sector_info(ind, '')['status'], 'ok')
+        self.put('tpex', rows={'6488': '24'}, stale=True)
+        self.assertEqual(screener.sector_info(screener.load_industry(d), '2026-10-22')['status'], 'stale')
+
+    def test_broken_files_never_raise(self):
+        d = self.put('twse')
+        for bad in ('not json', '[]', '{"v":1}', '{"rows":[],"fetched":"2026-10-20"}', '{"rows":{"1101":"01"},"fetched":"x"}',
+                    '\x00\x01', '{"rows":{}}'):
+            write(os.path.join(d, 'tpex.json'), bad)
+            ind = screener.load_industry(d)
+            self.assertEqual(ind['have'], 1, bad)
+            self.assertEqual(screener.sector_info(ind, '2026-10-22')['status'], 'stale', bad)
+        write(os.path.join(d, 'tpex.json'), b'\xff\xfe\x00')
+        self.assertEqual(screener.load_industry(d)['have'], 1)
+
+    def test_industry_dir_follows_data_dir(self):
+        d = screener.industry_dir(os.path.join(self.tmp, 'data'))
+        self.assertEqual(d, os.path.join(self.tmp, 'cache', 'industry'))
+
+    def test_attach_sectors_is_last_key_and_error_rows(self):
+        res = fake_results()
+        res.append(fake_rec('0050', '元大台灣50', 150.0, 0.1, 1.0))
+        screener.attach_sectors(res, {'1101': '01', '2330': '24'})
+        self.assertEqual([r['sector'] for r in res],
+                         ['傳產-水泥', '科技-半導體', 'ETF-市值型', '', '', '', '', 'ETF-市值型'])
+        for r in res:
+            self.assertEqual(list(r)[-1], 'sector')
+
+
+class TestSectorScan(TempCase):
+    def run_cli(self, *args):
+        env = clean_env(PYTHONUTF8='1', TWSTOCK_NO_OPEN='1')
+        return subprocess.run([sys.executable, os.path.join(ROOT, 'screener.py')] + list(args), cwd=self.tmp, env=env,
+                              capture_output=True, timeout=120)
+
+    def test_scan_with_and_without_cache(self):
+        d = os.path.join(self.tmp, 'data')
+        tag = make_data(d, ('1101', '2330', '0050'))
+        o1, o2 = os.path.join(self.tmp, 'o1'), os.path.join(self.tmp, 'o2')
+        r1 = self.run_cli('scan', '--data', d, '--out-dir', o1, '--capital', '1000000')
+        self.assertEqual(r1.returncode, 0, r1.stderr.decode('utf-8', 'replace'))
+        self.assertNotIn('類股', r1.stderr.decode('utf-8'))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'cache')))            # scan 不會建立或寫入快取資料夾
+        cdir = os.path.join(self.tmp, 'cache', 'industry')
+        mk = lambda rows: json.dumps({'v': 1, 'rows': rows, 'fetched': '2026-09-20', 'tried': '2026-09-20', 'stale': False, 'fails': 0})
+        write(os.path.join(cdir, 'twse.json'), mk({'1101': '01', '2330': '24'}))
+        write(os.path.join(cdir, 'tpex.json'), mk({'6488': '24'}))
+        before = {n: readb(os.path.join(cdir, n)) for n in os.listdir(cdir)}
+        r2 = self.run_cli('scan', '--data', d, '--out-dir', o2, '--capital', '1000000')
+        self.assertEqual(r2.returncode, 0)
+        self.assertEqual({n: readb(os.path.join(cdir, n)) for n in os.listdir(cdir)}, before)
+        for ext in ('md', 'txt'):
+            self.assertEqual(readb(os.path.join(o1, '盤後選股_%s.%s' % (tag, ext))), readb(os.path.join(o2, '盤後選股_%s.%s' % (tag, ext))))
+        j1 = json.loads(readb(os.path.join(o1, '盤後選股_%s.json' % tag)).decode('utf-8'))
+        j2 = json.loads(readb(os.path.join(o2, '盤後選股_%s.json' % tag)).decode('utf-8'))
+        self.assertEqual(len(j1), 3)
+        for a, b in zip(j1, j2):
+            self.assertEqual(list(a)[-1], 'sector')
+            self.assertEqual(list(b)[-1], 'sector')
+            self.assertEqual(list(a), list(b))
+            self.assertEqual({k: v for k, v in a.items() if k != 'sector'}, {k: v for k, v in b.items() if k != 'sector'})
+        self.assertEqual({r['code']: r['sector'] for r in j2}['1101'], '傳產-水泥')
+        self.assertEqual({r['code']: r['sector'] for r in j2}['2330'], '科技-半導體')
+        self.assertEqual({r['code']: r['sector'] for r in j1}['1101'], '')
+        for o in (o1, o2):
+            rows = list(csv.reader(io.StringIO(readb(os.path.join(o, '盤後選股_%s.csv' % tag)).decode('utf-8-sig'), newline='')))
+            self.assertEqual(rows[0][-1], '類股')
+            self.assertTrue(all(len(x) == len(rows[0]) for x in rows))
+        h1 = readb(os.path.join(o1, '盤後選股_%s.html' % tag)).decode('utf-8')
+        h2 = readb(os.path.join(o2, '盤後選股_%s.html' % tag)).decode('utf-8')
+        self.assertNotIn('id="csec"', h1)
+        self.assertNotIn('類股資料未更新', h1)
+        self.assertNotIn('類股資料未更新', h2)             # 資料日期前 14 天內更新的不算舊
+
+
+class TestSectorRender(unittest.TestCase):
+    def page(self, sectors, status='ok', fetched='2026-10-20'):
+        meta = meta_for(sector_info={'status': status, 'fetched': fetched})
+        return screener.render_html(sec_results(sectors), False, meta)
+
+    def test_labels_filter_and_summary(self):
+        h = self.page({'1101': '傳產-水泥', '2330': '科技-半導體', '00646': 'ETF-市值型', '6874': '科技-光電'})
+        self.assertIn('data-sec="科技-半導體"', h)
+        self.assertIn('<span class="sec">傳產-水泥</span>', h)
+        self.assertIn('<label class="fld" for="csec">類股<select id="csec">', h)
+        i = h.index('id="csec"')
+        sel = h[i:h.index('</select>', i)]
+        opts = re.findall(r'<option value="([^"]*)">([^<]*)</option>', sel)
+        self.assertEqual(opts[0], ('all', '全部 4'))
+        self.assertIn(('科技', '科技（全部）2'), opts)
+        self.assertIn(('科技-半導體', '科技-半導體 1'), opts)
+        self.assertIn(('傳產-水泥', '傳產-水泥 1'), opts)
+        self.assertIn(('ETF-市值型', 'ETF-市值型 1'), opts)
+        self.assertNotIn('傳產（全部）', sel)                      # 只有 1 個標籤的大類不放「全部」
+        self.assertNotIn('value="none"', sel)
+        self.assertIn('類股：科技-半導體 1 檔・科技-光電 1 檔・傳產-水泥 1 檔・ETF-市值型 1 檔</p>', h)
+        self.assertNotIn('類股資料未更新', h)
+        self.assertIn("csec.value", h)
+
+    def test_unclassified_and_etf_group(self):
+        h = self.page({'1101': '傳產-水泥', '00646': 'ETF-市值型', '2330': 'ETF-高股息'})
+        sel = h[h.index('id="csec"'):]
+        sel = sel[:sel.index('</select>')]
+        self.assertIn('<option value="ETF">ETF（全部）2</option>', sel)
+        self.assertIn('<option value="none">未分類 1</option>', sel)
+        self.assertIn('・未分類 1 檔</p>', h)
+
+    def test_none_hides_ui_but_keeps_etf_label(self):
+        h = self.page({'00646': 'ETF-市值型'}, status='none', fetched='')
+        self.assertNotIn('id="csec"', h)
+        self.assertNotIn('<p class="cap14">類股：', h)
+        self.assertIn('data-sec="ETF-市值型"', h)
+        self.assertIn('<span class="sec">ETF-市值型</span>', h)
+
+    def test_stale_note(self):
+        h = self.page({'1101': '傳產-水泥'}, status='stale', fetched='2026-09-01')
+        self.assertIn('類股資料未更新（上次更新 2026-09-01），分類可能不是最新的。', h)
+        h = self.page({'1101': '傳產-水泥'}, status='stale', fetched='')
+        self.assertIn('類股資料未更新，分類可能不是最新的。', h)
+
+    def test_escaping(self):
+        h = self.page({'1101': '<b>x</b>', '2330': '"><i>'})
+        self.assertNotIn('<b>x</b>', h)
+        self.assertNotIn('"><i>', h)
+        self.assertIn('&lt;b&gt;x&lt;/b&gt;', h)
+
+    def test_stage_json_and_watch(self):
+        res = sec_results({'1101': '傳產-水泥', '2454': '科技-IC設計', '1216': '傳產-食品'})
+        h = screener.render_html(res, False, meta_for(sector_info={'status': 'ok', 'fetched': '2026-10-20'}))
+        m = re.search(r'<script type="application/json" id="stage-data">(.*?)</script>', h)
+        pack = json.loads(m.group(1))
+        self.assertEqual(pack['s'], ['', '傳產-水泥', '傳產-食品', '科技-IC設計'])
+        by = {r[0]: r[7] for r in pack['r']}
+        self.assertEqual((by['1101'], by['1216'], by['2330']), (1, 2, 0))
+        self.assertIn('<span class="name">聯發科</span><span class="sec">科技-IC設計</span></th>', h)     # 觀察名單
+        self.assertIn('<th scope="col" class="lo"><button type="button" class="sb" data-key="2">類股', h)
+
+    def test_old_results_without_sector_still_render(self):
+        h = screener.render_html(fake_results(), False, meta_for())
+        self.assertNotIn('id="csec"', h)
+        self.assertIn('data-sec=""', h)
+
+
+class TestThemeToggle(unittest.TestCase):
+    def test_nav_buttons(self):
+        h = screener.render_html(fake_results(), False, meta_for())
+        nav = h[h.index('<div class="topnav">'):h.index('<main>')]
+        self.assertIn('role="group"', nav)
+        self.assertEqual(len(re.findall(r'<button type="button" class="tm" data-set="(?:auto|light|dark)" aria-pressed="(?:true|false)">', nav)), 3)
+        self.assertIn('data-set="auto" aria-pressed="true">自動<', nav)
+        self.assertIn('>淺色<', nav)
+        self.assertIn('>深色<', nav)
+        self.assertIn('資料日期 2026-10-22', nav)
+
+    def test_boot_script_in_head_is_guarded(self):
+        h = screener.render_html(fake_results(), False, meta_for())
+        head = h[:h.index('</head>')]
+        self.assertEqual(head.count('<script>'), 1)
+        self.assertIn(screener.THEME_BOOT, head)
+        self.assertIn('try{', screener.THEME_BOOT)
+        self.assertIn('catch(e){}', screener.THEME_BOOT)
+        self.assertLess(head.index('<script>'), head.index('<title>'))
+        self.assertEqual(h.count('twss-theme'), 2)                 # 開機腳本一次、頁面程式一次
+        self.assertIn("var TK = 'twss-theme';", screener.HTML_JS)
+
+    def test_every_storage_line_is_in_try(self):
+        lines = [x for x in screener.HTML_JS.split('\n') if 'localStorage' in x]
+        self.assertTrue(lines)
+        for x in lines:
+            self.assertIn('try {', x)
+            self.assertIn('catch', x)
+            self.assertFalse(re.search(r'\s//', x), x)
+        self.assertIn('localStorage', screener.THEME_BOOT)
+
+    def test_contrast(self):
+        P = screener.PALETTE
+        for name in ('light', 'dark'):
+            p = P[name]
+            self.assertGreaterEqual(wcag_ratio(p['ink2'], p['nav']), 4.5, name)
+            self.assertGreaterEqual(wcag_ratio(p['page'], p['ink']), 4.5, name)
+            self.assertGreaterEqual(wcag_ratio(p['accent'], p['nav']), 3, name)
+            self.assertGreaterEqual(wcag_ratio(p['ink2'], p['page']), 4.5, name)
+
+    def test_css_rules(self):
+        css = screener.HTML_CSS
+        self.assertLess(css.index('.tm:hover'), css.index('.tm[aria-pressed="true"]'))
+        self.assertIn('.navdate{display:none}', css[css.index('@media (max-width:734px)'):])
+        self.assertNotRegex(css, r'(?<![A-Za-z-])lh(?![A-Za-z-])')
+
+    def test_screener_has_no_network_imports(self):
+        with open(os.path.join(ROOT, 'screener.py'), encoding='utf-8') as f:
+            src = f.read()
+        self.assertIsNone(re.search(r'^\s*(?:import|from)\s+(?:urllib|http|socket|ssl)\b', src, re.M))
+
+
+class TestIndustryFetch(TempCase):
+    ROW = TestFetch.ROW
+
+    def setUp(self):
+        super().setUp()
+        isolate_net(self, sleep_fails=False, RETRY=(10, 30, 90))
+        self.clock = fake_clock(self)
+
+    def industry_log(self):
+        return [' '.join(str(x) for x in c.args) for c in fetch_data.log.call_args_list]
+
+    def test_industry_due(self):
+        due = fetch_data.industry_due
+        D = dt.date(2026, 10, 1)
+        ok = {'tried': D.isoformat(), 'stale': False, 'fails': 0}
+        self.assertTrue(due(None, D))
+        self.assertTrue(due({}, D))
+        self.assertTrue(due({'tried': 'x'}, D))
+        self.assertFalse(due(ok, D))
+        self.assertFalse(due(ok, D + dt.timedelta(days=6)))
+        self.assertTrue(due(ok, D + dt.timedelta(days=7)))
+        for fails, wait in ((1, 1), (2, 2), (3, 4), (4, 7), (9, 7)):
+            st = {'tried': D.isoformat(), 'stale': True, 'fails': fails}
+            self.assertFalse(due(st, D + dt.timedelta(days=wait - 1)), fails)
+            self.assertTrue(due(st, D + dt.timedelta(days=wait)), fails)
+
+    def test_refresh_success_and_weekly(self):
+        site = FakeSite()
+        D = dt.date(2026, 10, 1)
+        with mock.patch.object(fetch_data, '_open', site):
+            fetch_data.refresh_industry(D)
+            self.assertEqual(len(site.urls), 2)
+            fetch_data.refresh_industry(D + dt.timedelta(days=6))
+            self.assertEqual(len(site.urls), 2)
+            fetch_data.refresh_industry(D + dt.timedelta(days=7))
+            self.assertEqual(len(site.urls), 4)
+        j = fetch_data.read_industry('twse')
+        self.assertEqual((j['fetched'], j['tried'], j['stale'], j['fails']), ('2026-10-08',) * 2 + (False, 0))
+        self.assertEqual(len(j['rows']), 300)
+        raw = readb(fetch_data.ind_path('tpex')).decode('utf-8')
+        self.assertNotIn('Chairman', raw)                       # 只存 代號 -> 產業別
+        self.assertEqual(list(json.loads(raw)), sorted(json.loads(raw)))
+        self.assertFalse([n for n in os.listdir(os.path.dirname(fetch_data.ind_path('twse'))) if n.endswith('.tmp')])
+
+    def test_failure_keeps_old_rows_and_backs_off(self):
+        site = FakeSite()
+        D = dt.date(2026, 10, 1)
+        with mock.patch.object(fetch_data, '_open', site):
+            fetch_data.refresh_industry(D)
+        old = fetch_data.read_industry('twse')['rows']
+        calls = []
+
+        def down(url):
+            calls.append(url)
+            return 500, {}, b''
+        seen = []
+        with mock.patch.object(fetch_data, '_open', down):
+            for k in (7, 8, 9, 10, 14, 15, 21, 22, 28, 29):
+                n = len(calls)
+                fetch_data.refresh_industry(D + dt.timedelta(days=k))
+                seen.append((k, len(calls) - n))
+        # 第 7 天失敗（等 1 天）、第 8 天失敗（等 2 天）、第 10 天失敗（等 4 天）、第 14 天失敗（等 7 天）、第 21 天失敗
+        self.assertEqual([k for k, c in seen if c], [7, 8, 10, 14, 21, 28])
+        j = fetch_data.read_industry('twse')
+        self.assertEqual((j['stale'], j['fails'], j['fetched'], j['rows']), (True, 6, '2026-10-01', old))
+        self.assertEqual(self.clock.sleeps, [])               # 不等待重試
+
+    def test_structure_and_network_errors_only_warn(self):
+        D = dt.date(2026, 10, 1)
+        with mock.patch.object(fetch_data, '_open', return_value=(200, {}, b'[]')) as m:
+            fetch_data.refresh_industry(D)
+        self.assertEqual(m.call_count, 2)
+        self.assertTrue(any('注意' in x and '上市' in x for x in self.industry_log()))
+        self.assertTrue(fetch_data.read_industry('tpex')['stale'])
+        with mock.patch.object(fetch_data, '_open', return_value=(200, {}, b'{"a":1}')):
+            fetch_data.refresh_industry(D + dt.timedelta(days=30))
+        with mock.patch.object(fetch_data, '_open', side_effect=OSError('x')) as m:
+            fetch_data.refresh_industry(D + dt.timedelta(days=60))
+        self.assertEqual(m.call_count, 1)                       # 網路不通：只送 1 次，不重試
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_parse_industry(self):
+        p = fetch_data.parse_industry
+        rows = [{'公司代號': '%04d' % (1100 + i), '產業別': '24'} for i in range(300)]
+        rows += [{'SecuritiesCompanyCode': '6488', 'SecuritiesIndustryCode': '24'}, {'公司代號': '00631L', '產業別': '24'},
+                 {'公司代號': '2330', '產業別': '<b>'}, {'公司代號': '0999', '產業別': '24'}, 'x', {'公司代號': 1234}]
+        out = p(rows)
+        self.assertEqual(len(out), 301)
+        self.assertEqual(out['6488'], '24')
+        self.assertNotIn('00631L', out)
+        self.assertNotIn('2330', out)
+        with self.assertRaises(fetch_data.Structure):
+            p({'a': 1})
+        with self.assertRaises(fetch_data.Structure):
+            p(rows[:50])
+        self.assertEqual(p([{'公司代號': '%04d' % (1100 + i), '產業別': '半導體業'} for i in range(300)])['1100'], '半導體業')
+
+    def test_shares_limiter_with_tpex(self):
+        with mock.patch.object(fetch_data, 'GAP', 3.0), mock.patch.object(fetch_data, '_open', return_value=(200, {}, b'{}')):
+            fetch_data.get(fetch_data.TPEX_DAY.format(slash='2026/10/01'), lambda d: d)
+            t = self.clock.t
+            fetch_data.get(fetch_data.TPEX_IND, lambda d: d)
+        self.assertEqual(self.clock.t - t, 3.0)
+
+    def test_daily_exit_code_unaffected_and_once_a_day(self):
+        TestFetch.preload(self)
+        blocked = []
+
+        def down(url):
+            blocked.append(url)
+            return 403, {}, b''
+        with mock.patch.object(fetch_data, 'fetch_day', return_value='skipped'), \
+                mock.patch.object(fetch_data, 'sync_exright'), mock.patch.object(fetch_data, '_open', down):
+            self.assertEqual(fetch_data.cmd_daily(None), 0)
+        self.assertTrue(any('t187ap03' in u for u in blocked))
+        self.assertTrue(any('注意' in x for x in self.industry_log()))
+        site = FakeSite()
+        with mock.patch.object(fetch_data, 'fetch_day', return_value='skipped'), \
+                mock.patch.object(fetch_data, 'sync_exright'), mock.patch.object(fetch_data, '_open', site):
+            fetch_data._reset_net()
+            self.assertEqual(fetch_data.cmd_daily(None), 0)          # 今天已經試過失敗 1 次：1 天後才再試，所以今天 0 次
+            self.assertEqual([u for u in site.urls if 't187ap03' in u], [])
 
 
 if __name__ == '__main__':

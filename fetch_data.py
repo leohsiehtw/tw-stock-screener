@@ -7,6 +7,9 @@
   python fetch_data.py daily                                          每天收盤後增量更新（需先 backfill 過）
   python fetch_data.py build                                          只用 cache 重建 data/*.csv（離線）
 
+類股：daily／backfill 在 build() 之後，順便把官方的上市、上櫃公司基本資料裡的「產業別」存到
+cache/industry/（每週更新一次；失敗只提醒，不影響股價與結束代碼）。
+
 設計：cache/ 放原始每日快照（未還原），data/*.csv 每次都由 cache + 除權息事件整批重建，
 還原價不會被重複套用。csv 欄位 date,open,high,low,close,volume,raw_close,name。
 
@@ -44,6 +47,15 @@ WORKERS = 4               # 同時作業的執行緒數（每個網站同一時�
 RETRY = (10, 30, 90)      # 失敗後等待秒數再重試（整個網站一起等）
 KEEP = re.compile(r'^(?:[1-9]\d{3}|00\d{2,4}[A-Z]?)$')   # 一般股 + ETF
 NODATA = '沒有符合條件'
+# 類股（產業別）：公司基本資料。探測 2026-10-30 實測：兩邊都是 JSON 陣列，上市 1098 筆、上櫃 896 筆，
+# 代號鍵 公司代號／SecuritiesCompanyCode，產業別鍵 產業別／SecuritiesIndustryCode，值是 2 碼數字（01～38、91）
+TWSE_IND = 'https://openapi.twse.com.tw/v1/opendata/t187ap03_L'
+TPEX_IND = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O'
+IND_CODE_KEYS = ('公司代號', 'SecuritiesCompanyCode')
+IND_KEYS = ('產業別', 'SecuritiesIndustryCode')
+IND_MIN = 300             # 可用筆數少於這個數字就當作格式不對（實測上市約 1100、上櫃約 900）
+IND_DAYS = 7              # 類股資料每隔幾天更新一次
+IND_SITES = (('twse', '上市', TWSE_IND), ('tpex', '上櫃', TPEX_IND))
 
 E_NETWORK, E_SITE, E_NODATA, E_NEED_DATA = 3, 4, 5, 6
 
@@ -319,14 +331,15 @@ def _reset_net():
         _drop(name)
 
 
-def get(url, parse):
-    """對 url 送請求並用 parse 解析；失敗依 RETRY 重試。同一個網站一次只送一個請求，間隔至少 GAP 秒"""
+def get(url, parse, retry=None):
+    """對 url 送請求並用 parse 解析；失敗依 RETRY（或 retry）重試。同一個網站一次只送一個請求，間隔至少 GAP 秒"""
+    retry = RETRY if retry is None else retry
     h = _host(urllib.parse.urlsplit(url).netloc)
     while not h.lock.acquire(timeout=0.5):
         if STOP.is_set():
             raise _Aborted('已停止')
     try:
-        for i in range(len(RETRY) + 1):
+        for i in range(len(retry) + 1):
             if STOP.is_set():
                 raise _Aborted('已停止')
             while h.next - _now() > 0:          # 等到輪到自己；提早醒來就再等
@@ -348,13 +361,13 @@ def get(url, parse):
                     if stop:
                         STOP.set()
                         raise
-                if i == len(RETRY):
+                if i == len(retry):
                     if e.kind == 'network':
                         STOP.set()             # 還拿著鎖，其他執行緒不會再送請求
                     raise
-                log('連線失敗，%d 秒後重試（%s）' % (RETRY[i], str(e)[:120]))
+                log('連線失敗，%d 秒後重試（%s）' % (retry[i], str(e)[:120]))
                 h.retries += 1
-                h.next = max(h.next, _now() + RETRY[i])
+                h.next = max(h.next, _now() + retry[i])
     finally:
         h.lock.release()
 
@@ -697,6 +710,82 @@ def build():
     log('build: %d stocks, latest %s, removed stale %d' % (len(written), latest, removed))
 
 
+# ---------- 類股（產業別）快取：cache/industry/twse.json、tpex.json ----------
+def ind_path(mkt):
+    return os.path.join(CACHE, 'industry', mkt + '.json')
+
+
+def read_industry(mkt):
+    """讀快取；沒有檔案或讀不懂回傳 None"""
+    try:
+        with open(ind_path(mkt), encoding='utf-8') as f:
+            d = json.load(f)
+        if d['v'] != 1 or not isinstance(d['rows'], dict):
+            return None
+        return d
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def parse_industry(d):
+    """公司基本資料 -> {代號: 原始產業別}；只留 4 碼一般股，其他存證等不要"""
+    if not isinstance(d, list):
+        raise Structure('industry: not a list')
+    rows = {}
+    for x in d:
+        if not isinstance(x, dict):
+            continue
+        c = next((x[k] for k in IND_CODE_KEYS if isinstance(x.get(k), str) and x[k].strip()), '')
+        v = next((x[k] for k in IND_KEYS if isinstance(x.get(k), str) and x[k].strip()), '')
+        c, v = c.strip(), v.strip()
+        if re.fullmatch(r'[1-9][0-9]{3}', c) and re.fullmatch(r'[0-9]{1,2}|[\u4e00-\u9fff]{2,12}', v):
+            rows[c] = v
+    if len(rows) < IND_MIN:
+        raise Structure('industry: only %d usable rows' % len(rows))
+    return rows
+
+
+def industry_due(old, today):
+    """今天要不要抓：沒有檔案或讀不懂要抓；成功後每 IND_DAYS 天一次；失敗後 1、2、4、7 天再試。同一天最多試一次"""
+    if not old:
+        return True
+    try:
+        tried = dt.date.fromisoformat(old['tried'])
+        wait = IND_DAYS
+        if old.get('stale'):
+            wait = min(IND_DAYS, 2 ** max(0, int(old.get('fails') or 0) - 1))
+        return (today - tried).days >= wait
+    except (KeyError, ValueError, TypeError):
+        return True
+
+
+def refresh_industry(today=None):
+    """更新類股快取。除了 KeyboardInterrupt，絕不丟例外；失敗只提醒"""
+    today = today or dt.date.today()
+    iso = today.isoformat()
+    for mkt, label, url in IND_SITES:
+        try:
+            old = read_industry(mkt)
+            if not industry_due(old, today):
+                continue
+            try:
+                rows = get(url, parse_industry, retry=())
+                new = {'v': 1, 'rows': rows, 'fetched': iso, 'tried': iso, 'stale': False, 'fails': 0}
+                note = '類股資料已更新：%s %d 家' % (label, len(rows))
+            except _Aborted:
+                raise
+            except Exception as e:
+                new = {'v': 1, 'rows': (old or {}).get('rows') or {}, 'fetched': (old or {}).get('fetched') or '',
+                       'tried': iso, 'stale': True, 'fails': int((old or {}).get('fails') or 0) + 1}
+                note = '注意：%s的類股資料這次沒有更新（%s），先沿用上次的資料；股價與選股不受影響。' % (label, str(e)[:80])
+            write_atomic(ind_path(mkt), json.dumps(new, ensure_ascii=False, sort_keys=True, separators=(',', ':')))
+            log(note)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            log('注意：%s的類股資料這次沒有更新，股價與選股不受影響。' % label)
+
+
 # ---------- 指令 ----------
 def parse_ymd(s):
     return dt.datetime.strptime(s, '%Y%m%d').date()
@@ -869,6 +958,7 @@ def run_backfill(start, end, sparse):
     n = lambda name: _hosts[name].count if name in _hosts else 0
     log('耗時 %s；請求：證交所 %d、櫃買中心 %d；重試 %d 次'
         % (_fmt_dur(_now() - t0), n('www.twse.com.tw'), n('www.tpex.org.tw'), sum(h.retries for h in _hosts.values())))
+    refresh_industry()
     _incomplete(st['site_days'], st['nodata'])
     return 0
 
@@ -929,6 +1019,7 @@ def cmd_daily(a):
         _incomplete(site_days, nodata)
     sync_exright(start, today)
     build()
+    refresh_industry(today)
     return 0
 
 

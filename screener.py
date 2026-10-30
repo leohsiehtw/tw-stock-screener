@@ -699,6 +699,13 @@ p{margin:0}
 .topnav .wrap{height:44px;display:flex;align-items:center;justify-content:space-between;gap:16px}
 .brand{font-size:14px;line-height:18px;font-weight:600}
 .navdate{font-size:12px;line-height:16px;color:var(--ink2)}
+.navr{display:flex;align-items:center;gap:16px;min-width:0}
+.theme{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--hairline);border-radius:980px}
+.tm{position:relative;font:inherit;font-size:12px;line-height:16px;letter-spacing:normal;color:var(--ink2);background:none;border:0;border-radius:980px;padding:4px 10px;min-width:44px;cursor:pointer}
+.tm::after{content:"";position:absolute;left:0;right:0;top:-10px;bottom:-10px}
+.tm:hover{color:var(--ink)}
+.tm[aria-pressed="true"]{background:var(--ink);color:var(--page)}
+.sec{display:inline-block;margin-left:8px;font-size:12px;line-height:16px;font-weight:400;color:var(--ink2);white-space:nowrap}
 .band{padding-block:48px 56px;--card:var(--surface);scroll-margin-top:44px}
 .band.alt{background:var(--surface);--card:var(--page)}
 .stack{display:flex;flex-direction:column;gap:24px}
@@ -804,6 +811,7 @@ h1{font-size:32px;line-height:36px}
 }
 @media (max-width:734px){
 .wrap{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.navdate{display:none}
 .band{padding-block:39px 43px}
 h1{font-size:28px;line-height:32px}
 h2{font-size:24px;line-height:28px}
@@ -833,12 +841,19 @@ thead th{white-space:normal}
 @media print{.topnav{position:static}.needs-js{display:none}}
 '''.replace('@@LIGHT@@', _css_vars(PALETTE['light'])).replace('@@DARK@@', _css_vars(PALETTE['dark']))
 
+# 放在 <head> 裡先跑：讀出上次選的淺色／深色，頁面畫出來之前就套用（避免閃一下）。localStorage 被擋時什麼都不做
+THEME_BOOT = ("(function(){var r=document.documentElement,t='';r.className=r.className.replace('nojs','js');"
+              "try{t=localStorage.getItem('twss-theme')||'';}catch(e){}"
+              "if(t==='light'||t==='dark'){r.setAttribute('data-theme',t);"
+              "var m=document.querySelector('meta[name=\"color-scheme\"]');if(m){m.setAttribute('content',t);}}})();")
+
 HTML_HEAD = '''<!DOCTYPE html>
 <html lang="zh-Hant" class="nojs">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<script>''' + THEME_BOOT + '''</script>
 <title>@@TITLE@@</title>
 <style>''' + HTML_CSS + '''</style>
 </head>
@@ -854,6 +869,21 @@ HTML_JS = r'''
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
+  var TK = 'twss-theme';
+  function setTheme(t, keep) {
+    var r = d.documentElement, m = d.querySelector('meta[name="color-scheme"]');
+    if (t !== 'light' && t !== 'dark') { t = 'auto'; }
+    if (t === 'auto') { r.removeAttribute('data-theme'); } else { r.setAttribute('data-theme', t); }
+    if (m) { m.setAttribute('content', t === 'auto' ? 'light dark' : t); }
+    all('.tm').forEach(function (b) { b.setAttribute('aria-pressed', b.getAttribute('data-set') === t ? 'true' : 'false'); });
+    if (keep) {
+      try { if (t === 'auto') { localStorage.removeItem(TK); } else { localStorage.setItem(TK, t); } } catch (e) { }
+    }
+  }
+  var t0 = 'auto';
+  try { t0 = localStorage.getItem(TK) || 'auto'; } catch (e) { }
+  setTheme(t0, false);
+  all('.tm').forEach(function (b) { b.addEventListener('click', function () { setTheme(b.getAttribute('data-set'), true); }); });
   function cmp(x, y, num) {
     if (num) {
       x = parseFloat(x); y = parseFloat(y);
@@ -900,7 +930,7 @@ HTML_JS = r'''
   var ct = d.getElementById('ct');
   if (ct) {
     var cands = all('tbody.cand', ct), sel = d.getElementById('csort'), q = d.getElementById('cq');
-    var st = d.getElementById('cstatus'), none = d.getElementById('cnone');
+    var st = d.getElementById('cstatus'), none = d.getElementById('cnone'), csec = d.getElementById('csec');
     var sortC = makeSortable(ct, cands, ct, function (key, dir) {
       var v = key + '|' + dir;
       if (sel) { sel.value = key === 'i' ? 'i|ascending' : v; if (sel.value !== (key === 'i' ? 'i|ascending' : v)) { sel.selectedIndex = -1; } }
@@ -916,10 +946,11 @@ HTML_JS = r'''
       if (st) { st.textContent = '顯示 ' + shown + ' / ' + cands.length + ' 檔' + (o ? '，' + o : ''); }
     };
     var filter = function () {
-      var t = radio('ft'), k = radio('fk'), s = q ? q.value.replace(/^\s+|\s+$/g, '').toLowerCase() : '';
+      var t = radio('ft'), k = radio('fk'), g = csec ? csec.value : 'all', s = q ? q.value.replace(/^\s+|\s+$/g, '').toLowerCase() : '';
       shown = 0;
       cands.forEach(function (c) {
         var ok = (t === 'all' || c.getAttribute('data-type') === t) && (k === 'all' || c.getAttribute('data-kind') === k)
+          && (g === 'all' || (g === 'none' ? !c.getAttribute('data-sec') : (c.getAttribute('data-sec') === g || c.getAttribute('data-sec').split('-')[0] === g)))
           && (!s || (c.getAttribute('data-code') + ' ' + c.getAttribute('data-name')).toLowerCase().indexOf(s) >= 0);
         c.hidden = !ok;
         if (ok) { shown++; }
@@ -929,6 +960,7 @@ HTML_JS = r'''
     };
     all('input[name="ft"],input[name="fk"]').forEach(function (r) { r.addEventListener('change', filter); });
     if (q) { q.addEventListener('input', filter); }
+    if (csec) { csec.addEventListener('change', filter); }
     filter();
   }
 
@@ -945,12 +977,12 @@ HTML_JS = r'''
     open();
   }
   function initStages() {
-    var data = JSON.parse(d.getElementById('stage-data').textContent);
+    var pack = JSON.parse(d.getElementById('stage-data').textContent), data = pack.r, SEC = pack.s;
     var tb = d.getElementById('st-body'), more = d.getElementById('st-more'), info = d.getElementById('st-info');
     var dq = d.getElementById('dq'), table = d.getElementById('st'), view = data, n = 0, CH = 200;
     data.forEach(function (r, i) { r.push(i); });
     function row(r) {
-      var s = '<tr><th scope="row">' + esc(r[0]) + '</th><td>' + esc(r[1]) + '</td><td class="n">' + esc(r[2]) + '</td>';
+      var s = '<tr><th scope="row">' + esc(r[0]) + '</th><td>' + esc(r[1]) + '</td><td class="lo">' + esc(SEC[r[7]] || '—') + '</td><td class="n">' + esc(r[2]) + '</td>';
       for (var k = 0; k < 6; k++) { s += (r[3] >> k) & 1 ? '<td class="y">✓</td>' : '<td class="x">✗</td>'; }
       return s + '<td class="n lo">' + r[4].toFixed(2) + '</td><td class="n lo">' + esc(r[5]) + ' → ' + esc(r[6]) + '</td></tr>';
     }
@@ -966,20 +998,21 @@ HTML_JS = r'''
     }
     function key(r, c) {
       if (c < 2) { return r[c]; }
-      if (c === 2) { return parseFloat(r[2]); }
-      if (c < 9) { return (r[3] >> (c - 3)) & 1; }
-      return c === 9 ? r[4] : parseFloat(r[6]);
+      if (c === 2) { return SEC[r[7]] || ''; }
+      if (c === 3) { return parseFloat(r[2]); }
+      if (c < 10) { return (r[3] >> (c - 4)) & 1; }
+      return c === 10 ? r[4] : parseFloat(r[6]);
     }
     var sk = -1, sd = '';
     function apply() {
       var s = dq.value.replace(/^\s+|\s+$/g, '').toLowerCase();
       view = s ? data.filter(function (r) { return (r[0] + ' ' + r[1]).toLowerCase().indexOf(s) >= 0; }) : data.slice();
       if (sk >= 0) {
-        var num = sk > 1;
+        var num = sk > 2;
         view.sort(function (a, b) {
           var r = cmp(key(a, sk), key(b, sk), num);
           if (sd === 'descending') { r = -r; }
-          return r || (a[7] - b[7]);
+          return r || (a[8] - b[8]);
         });
       }
       draw(true);
@@ -1002,6 +1035,132 @@ HTML_TAIL = '<script>' + HTML_JS + '</script>\n</body>\n</html>\n'
 
 WEEKDAYS = '一二三四五六日'
 IS_ETF = re.compile(r'^00')      # 和 fetch_data.KEEP 一樣：00 開頭是 ETF
+
+# ---------- 類股 ----------
+# (大類, ((官方產業別代碼, 官方名稱), ...))，順序就是頁面上的顯示順序。2026-10-30 用證交所、櫃買中心的公司基本資料
+# 和證交所 ISIN 公告查證（各代碼的公司名稱都一致）：01～12、14～18、20～33、35～38 實測；
+# 19 綜合、34 電子商務、80 管理股票、91 存託憑證 當天沒有可對照的公司，名稱未實測
+INDUSTRY = (
+    ('科技', (('24', '半導體業'), ('25', '電腦及週邊設備業'), ('26', '光電業'), ('27', '通信網路業'), ('28', '電子零組件業'),
+              ('29', '電子通路業'), ('30', '資訊服務業'), ('31', '其他電子業'), ('36', '數位雲端'), ('34', '電子商務'))),
+    ('金融', (('17', '金融保險業'),)),
+    ('傳產', (('01', '水泥工業'), ('02', '食品工業'), ('03', '塑膠工業'), ('04', '紡織纖維'), ('05', '電機機械'), ('06', '電器電纜'),
+              ('08', '玻璃陶瓷'), ('09', '造紙工業'), ('10', '鋼鐵工業'), ('11', '橡膠工業'), ('12', '汽車工業'), ('21', '化學工業'),
+              ('23', '油電燃氣業'), ('18', '貿易百貨業'), ('16', '觀光餐旅'), ('37', '運動休閒'), ('38', '居家生活'),
+              ('32', '文化創意業'), ('33', '農業科技業'), ('19', '綜合'), ('20', '其他業'))),
+    ('生技醫療', (('22', '生技醫療業'),)),
+    ('建材營造', (('14', '建材營造業'),)),
+    ('航運', (('15', '航運業'),)),
+    ('綠能環保', (('35', '綠能環保'),)),
+    ('管理股票', (('80', '管理股票'),)),
+    ('存託憑證', (('91', '存託憑證'),)),
+)
+INDUSTRY_SHORT = {'電腦及週邊設備業': '電腦週邊', '觀光事業': '觀光餐旅'}
+# ETF 類型，由上往下第一個符合的為準：(標籤, 代號最後一碼, 名稱關鍵字)；名稱先做 NFKC 再轉大寫
+ETF_TYPES = (
+    ('ETF-槓桿反向', 'LR', ('正2', '反1', '槓桿', '反向')),
+    ('ETF-債券', 'B', ('債',)),
+    ('ETF-商品期貨', 'U', ('黃金', '原油', '石油', '期貨')),
+    ('ETF-高股息', '', ('高股息', '高息', '股息')),
+    ('ETF-市值型', '', ('台灣50', '臺灣50', '台50', '中型100', '台灣加權', '臺灣加權', 'MSCI台灣', '摩台', 'S&P500', '標普500',
+                       '美國500', '美國50', 'NASDAQ', '那斯達克', '市值')),
+)
+ETF_OTHER = 'ETF-其他'      # 不叫「ETF」：篩選選單的「ETF（全部）」值就是 ETF
+SECTOR_STALE_DAYS = 14      # 類股資料比資料日期舊超過這麼多天，頁面上提醒
+
+
+def trim_industry(name):
+    """官方產業別名稱 -> 短名稱：先套例外表，再依序試去掉結尾的「工業」「業」（剩下至少 2 個字才去）"""
+    name = INDUSTRY_SHORT.get(name, name)
+    for suf in ('工業', '業'):
+        if name.endswith(suf) and len(name) - len(suf) >= 2:
+            return name[:-len(suf)]
+    return name
+
+
+def _build_sectors():
+    by_code, by_name, order = {}, {}, []
+    for big, subs in INDUSTRY:
+        for code, official in subs:
+            label = big if len(subs) == 1 else '%s-%s' % (big, trim_industry(official))
+            by_code[code] = label
+            by_name[trim_industry(official)] = label
+            if label not in order:
+                order.append(label)
+    return by_code, by_name, order
+
+
+SECTOR_BY_CODE, SECTOR_BY_NAME, _ORDER = _build_sectors()
+ETF_LABELS = tuple(t[0] for t in ETF_TYPES) + (ETF_OTHER,)
+SECTOR_ORDER = tuple(_ORDER) + ETF_LABELS
+SECTOR_LABELS = frozenset(SECTOR_ORDER)
+
+
+def etf_type(code, name):
+    n = unicodedata.normalize('NFKC', name or '').upper()
+    last = (code or '')[-1:]
+    for label, letters, words in ETF_TYPES:
+        if (last.isalpha() and last in letters) or any(w.upper() in n for w in words):
+            return label
+    return ETF_OTHER
+
+
+def sector_of(code, name, rows):
+    """類股標籤。ETF 看代號與名稱（不看快取）；其他看快取裡的官方產業別（代碼或名稱）；查不到回傳空字串"""
+    if IS_ETF.match(code or ''):
+        return etf_type(code, name)
+    raw = str((rows or {}).get(code) or '').strip()
+    if re.fullmatch(r'[0-9]{1,2}', raw):
+        return SECTOR_BY_CODE.get(raw.zfill(2), '')
+    return SECTOR_BY_NAME.get(trim_industry(raw), '') if raw else ''
+
+
+def attach_sectors(res, rows):
+    """每筆（含資料不足的）最後加上 sector；要在 size() 之後呼叫，這樣 sector 一定是最後一個鍵"""
+    for r in res:
+        r['sector'] = sector_of(r.get('code'), r.get('name'), rows)
+
+
+def industry_dir(data):
+    """類股快取在 --data 的上一層的 cache/industry（fetch_data.py 寫的）"""
+    return os.path.join(os.path.dirname(os.path.abspath(data)), 'cache', 'industry')
+
+
+def load_industry(d):
+    """讀上市、上櫃的類股快取，絕不丟例外。回傳 rows（代號 -> 原始產業別）、have（讀得到幾邊）、stale、fetched（較舊的那天）"""
+    rows, have, stale, days = {}, 0, False, []
+    for mkt in ('twse', 'tpex'):
+        try:
+            with open(os.path.join(d, mkt + '.json'), encoding='utf-8') as f:
+                j = json.load(f)
+            r, fetched = j['rows'], j.get('fetched') or ''
+            if not isinstance(r, dict) or not r or (fetched and not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', str(fetched))):
+                raise ValueError
+        except Exception:
+            stale = True
+            continue
+        rows.update((k, v) for k, v in r.items() if isinstance(k, str) and isinstance(v, str))
+        have += 1
+        stale = stale or bool(j.get('stale'))
+        days.append(str(fetched))
+    return dict(rows=rows, have=have, stale=stale, fetched=min(days) if days and all(days) else '')
+
+
+def sector_info(ind, date):
+    """類股資料的狀態：none 沒有；ok；stale 有一邊缺或更新失敗，或比資料日期舊超過 SECTOR_STALE_DAYS 天"""
+    if not ind['rows']:
+        return dict(status='none', fetched='')
+    stale = ind['stale'] or ind['have'] < 2 or not ind['fetched']
+    if not stale and date:
+        try:
+            stale = (dt.date.fromisoformat(date) - dt.date.fromisoformat(ind['fetched'])).days > SECTOR_STALE_DAYS
+        except ValueError:
+            pass
+    return dict(status='stale' if stale else 'ok', fetched=ind['fetched'])
+
+
+def _sec_key(label):
+    return (SECTOR_ORDER.index(label), '') if label in SECTOR_ORDER else (len(SECTOR_ORDER), label)
 
 
 def _dow(date):
@@ -1099,6 +1258,44 @@ def _seg(name, legend, opts):
     return ''.join(out) + '</fieldset>'
 
 
+def _sec_stale(sinfo):
+    """類股資料不是最新時的提醒（ok／none 回傳空字串）"""
+    if (sinfo or {}).get('status') != 'stale':
+        return ''
+    when = '（上次更新 %s）' % html.escape(str(sinfo.get('fetched') or '')) if sinfo.get('fetched') else ''
+    return '<p class="cap14">類股資料未更新%s，分類可能不是最新的。</p>' % when
+
+
+def _sector_ui(cands, sinfo):
+    """候選標的的類股統計列與選單：沒有類股資料、或一檔都沒分到類時回傳 ('', '')"""
+    if (sinfo or {}).get('status', 'none') == 'none' or not any(r.get('sector') for r in cands):
+        return '', ''
+    h = html.escape
+    cnt = {}
+    for r in cands:
+        cnt[r.get('sector') or ''] = cnt.get(r.get('sector') or '', 0) + 1
+    labels = sorted((l for l in cnt if l), key=_sec_key)
+    strip = sorted(labels, key=lambda l: (-cnt[l], _sec_key(l)))
+    parts = ['%s %d 檔' % (l, cnt[l]) for l in strip] + (['未分類 %d 檔' % cnt['']] if cnt.get('') else [])
+    cap = '<p class="cap14">%s</p>' % h('類股：' + '・'.join(parts))
+    opts = ['<option value="all">%s</option>' % h('全部 %d' % len(cands))]
+    groups = []
+    for l in labels:
+        g = l.split('-')[0]
+        if groups and groups[-1][0] == g:
+            groups[-1][1].append(l)
+        else:
+            groups.append((g, [l]))
+    for g, ls in groups:
+        if len(ls) > 1:
+            opts.append('<option value="%s">%s</option>' % (_a(g), h('%s（全部）%d' % (g, sum(cnt[l] for l in ls)))))
+        opts += ['<option value="%s">%s</option>' % (_a(l), h('%s %d' % (l, cnt[l]))) for l in ls]
+    if cnt.get(''):
+        opts.append('<option value="none">%s</option>' % h('未分類 %d' % cnt['']))
+    sel = '<label class="fld" for="csec">類股<select id="csec">%s</select></label>' % ''.join(opts)
+    return cap, sel
+
+
 def _sec_summary(B, ctx):
     h = html.escape
     date, res, ok, cands, watch = ctx['date'], ctx['res'], ctx['ok'], ctx['cands'], ctx['watch']
@@ -1115,9 +1312,14 @@ def _sec_summary(B, ctx):
              '<div><dt>%s</dt><dd>%d<small>檔</small></dd></div></dl>' % (
                  len(cands), nb, len(cands) - nb, h(ctx['wname']), len(watch)))
     B.append('<p class="cap14">%s</p>' % h('範圍：%s｜部位：%s' % (ctx['scope'], ctx['pos'])))
+    B.extend(x for x in (_sec_stale(ctx.get('sinfo')),) if x)
     B.append('<nav class="jump" aria-label="本頁段落"><a href="#cands">候選標的</a><a href="#watch">%s</a>'
              '<a href="#stages">各關明細</a><a href="#help">怎麼看這一頁</a></nav>' % h(ctx['wname']))
     B.append('</div></header>')
+
+
+def _sec_tag(r):
+    return '<span class="sec">%s</span>' % html.escape(r['sector']) if r.get('sector') else ''
 
 
 def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台積'):
@@ -1130,6 +1332,8 @@ def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台
         return
     nb = sum(1 for r in cands if r['type'] == '突破型')
     ne = sum(1 for r in cands if IS_ETF.match(r['code']))
+    sec_cap, sec_sel = _sector_ui(cands, ctx.get('sinfo'))
+    B.extend(x for x in (sec_cap,) if x)
     sorts = [('i|ascending', '預設（型態，量比大到小）'), ('vr|descending', '量比大到小'), ('vr|ascending', '量比小到大'),
              ('chg|descending', '漲跌% 大到小'), ('chg|ascending', '漲跌% 小到大'),
              ('dist|ascending', '停損距離 近到遠'), ('dist|descending', '停損距離 遠到近'),
@@ -1137,6 +1341,7 @@ def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台
     B.append('<div class="tools needs-js">'
              + _seg('ft', '型態', [('all', '全部 %d' % len(cands)), ('突破型', '突破型 %d' % nb), ('回測型', '回測型 %d' % (len(cands) - nb))])
              + _seg('fk', '類別', [('all', '全部 %d' % len(cands)), ('stock', '個股 %d' % (len(cands) - ne)), ('etf', 'ETF %d' % ne)])
+             + sec_sel
              + '<label class="fld" for="cq">搜尋代號或名稱<input type="search" id="cq" autocomplete="off" placeholder="%s"></label>' % _a(placeholder)
              + '<label class="fld" for="csort">排序<select id="csort">'
              + ''.join('<option value="%s">%s</option>' % (_a(v), h(t)) for v, t in sorts)
@@ -1161,8 +1366,9 @@ def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台
         attrs = dict(i=i, type=r['type'], kind='etf' if IS_ETF.match(r['code']) else 'stock', code=r['code'],
                      name=r['name'], close=r['close'], chg=r['chg'], vr=r['vol_ratio'], stop=r['stop'], dist=dist)
         attrs.update(('p%d' % j, p[0]) for (p, _), (j, _) in zip(pos, pcols))
+        attrs['sec'] = r.get('sector') or ''
         cells = ['<th scope="row" class="nm"><span class="tag %s">%s</span><br><span class="code">%s</span>'
-                 '<span class="name">%s</span></th>' % (tcls, h(r['type']), h(r['code']), h(r['name'])),
+                 '<span class="name">%s</span>%s</th>' % (tcls, h(r['type']), h(r['code']), h(r['name']), _sec_tag(r)),
                  '<td class="n" data-label="收盤">%s</td>' % h(str(r['close'])),
                  '<td class="n" data-label="漲跌%%">%s</td>' % _chg(r['chg']),
                  '<td class="n" data-label="量比">%.2f</td>' % r['vol_ratio'],
@@ -1199,10 +1405,10 @@ def _sec_watch(B, ctx, list_mode):
         attrs = dict(i=i, code=r['code'], name=r['name'], close=r['close'], chg=r['chg'], vr=r['vol_ratio'],
                      w0=int(bool(s[0])), w1=int(bool(s[1])), osc=r['osc'][1])
         chk = lambda b, lab: '<td class="%s" data-label="%s">%s</td>' % ('y' if b else 'x', lab, '✓ 通過' if b else '✗ 未過')
-        rows.append('<tr %s><th scope="row" class="nm"><span class="code">%s</span><span class="name">%s</span></th>'
+        rows.append('<tr %s><th scope="row" class="nm"><span class="code">%s</span><span class="name">%s</span>%s</th>'
                     '<td class="n" data-label="收盤">%s</td><td class="n" data-label="漲跌%%">%s</td>'
                     '<td class="n" data-label="量比">%.2f</td>%s%s<td class="n" data-label="OSC 昨→今">%s → %s</td></tr>' % (
-                        ' '.join('data-%s="%s"' % (k, _a(v)) for k, v in attrs.items()), h(r['code']), h(r['name']),
+                        ' '.join('data-%s="%s"' % (k, _a(v)) for k, v in attrs.items()), h(r['code']), h(r['name']), _sec_tag(r),
                         h(str(r['close'])), _chg(r['chg']), r['vol_ratio'], chk(s[0], '0 週線'), chk(s[1], '1 趨勢'),
                         h(str(r['osc'][0])), h(str(r['osc'][1]))))
     B.append('<div class="card tw cards"><table class="sortable wt" id="wt"><caption class="vh">%s；按欄位名稱可以排序'
@@ -1211,13 +1417,16 @@ def _sec_watch(B, ctx, list_mode):
 
 
 def _stage_json(ok):
-    """各關明細的精簡資料：[代號, 名稱, 收盤, 各關位元(0,1,2,3,A,B), 量比, OSC 昨, OSC 今]"""
+    """各關明細的精簡資料：{"s": ["", 類股標籤…], "r": [[代號, 名稱, 收盤, 各關位元(0,1,2,3,A,B), 量比, OSC 昨, OSC 今, 類股編號]]}"""
+    labels = sorted({r.get('sector') for r in ok if r.get('sector')}, key=_sec_key)
+    idx = {l: i + 1 for i, l in enumerate(labels)}
     rows = []
     for r in ok:
         s = r['stages']
         bits = sum(1 << k for k, v in enumerate((s[0], s[1], s[2], s[3], s['A'], s['B'])) if v)
-        rows.append([r['code'], r['name'], str(r['close']), bits, r['vol_ratio'], str(r['osc'][0]), str(r['osc'][1])])
-    j = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
+        rows.append([r['code'], r['name'], str(r['close']), bits, r['vol_ratio'], str(r['osc'][0]), str(r['osc'][1]),
+                     idx.get(r.get('sector'), 0)])
+    j = json.dumps({'s': [''] + labels, 'r': rows}, ensure_ascii=False, separators=(',', ':'))
     return j.replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
 
 
@@ -1228,7 +1437,7 @@ def _sec_stages(B, ctx):
     B.append('<div class="stack" style="gap:8px"><h2 id="stages-h">各關明細（%d 檔）</h2><p class="cap14">'
              '每一檔通過了哪些關卡：✓ 通過、✗ 沒通過。檔數多，預設收起來，展開後每次列出 200 檔。</p></div>' % len(ok))
     if ok:
-        cols = [('代號', False, ''), ('名稱', False, ''), ('收盤', True, 'n'), ('0 週線', True, 'y'), ('1 趨勢', True, 'y'),
+        cols = [('代號', False, ''), ('名稱', False, ''), ('類股', False, 'lo'), ('收盤', True, 'n'), ('0 週線', True, 'y'), ('1 趨勢', True, 'y'),
                 ('2 動能', True, 'y'), ('3 量能', True, 'y'), ('A 突破', True, 'y'), ('B 回測', True, 'y'),
                 ('量比', True, 'n lo'), ('OSC 昨→今', True, 'n lo')]
         B.append('<details id="stages-det"><summary>展開各關明細（%d 檔）</summary>'
@@ -1263,7 +1472,8 @@ def _sec_help(B, ctx):
 <li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
 <li>部位：依「單筆虧損 = 總資金 × 比例」反推股數，1 張 = 1000 股。<span class="p-cap">紫色</span>表示已經買到總資金上限，<span class="p-odd">橘色</span>表示不到 1 張（零股）。沒設定總資金就不會有這一欄。</li>
 <li>觀察名單是第二優先：動能和量能到了、型態還沒到。各關明細檔數多，預設收起來，按「展開」才列出，可以搜尋和排序。</li>
-<li>頁面會跟著電腦或手機的淺色／深色設定切換；手機上表格會改成一張一張的卡片。</li>
+<li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成高股息、市值型、債券等；候選標的可以用「類股」選單篩選。查不到的標示為未分類（各關明細寫「—」）。</li>
+<li>頁面右上角可切換自動（跟著電腦或手機）／淺色／深色，選擇記在這個瀏覽器；無痕或封鎖網站資料時只在這次有效。手機上表格會改成一張一張的卡片。</li>
 </ul>
 <p>進場後：停損跌破月線或突破長紅 K 低點；單筆虧損控制在總資金 2%～5%；停利用移動停損，跟著月線或 5 日線上移。</p>
 <p class="cap14">本頁僅供程式與技術分析研究，不是投資建議，也不保證任何績效。資料可能延遲、缺漏或有誤，請以交易所公告為準。投資風險由使用者自行承擔。</p>
@@ -1272,7 +1482,12 @@ def _sec_help(B, ctx):
 
 def _topnav(date):
     return ('<div class="topnav"><div class="wrap"><span class="brand">台股盤後選股</span>'
-            '<span class="navdate">資料日期 %s</span></div></div>' % html.escape(date + _dow(date)))
+            '<div class="navr"><span class="navdate">資料日期 %s</span>'
+            '<div class="theme needs-js" role="group" aria-label="頁面顏色">'
+            '<button type="button" class="tm" data-set="auto" aria-pressed="true">自動</button>'
+            '<button type="button" class="tm" data-set="light" aria-pressed="false">淺色</button>'
+            '<button type="button" class="tm" data-set="dark" aria-pressed="false">深色</button>'
+            '</div></div></div></div>' % html.escape(date + _dow(date)))
 
 
 def render_html(res, list_mode, meta):
@@ -1292,6 +1507,7 @@ def render_html(res, list_mode, meta):
     ctx = dict(res=res, ok=ok, date=date, title=title, meta=meta, scope=scope,
                cands=sorted([r for r in ok if r.get('type')], key=lambda r: (r['type'], -r['vol_ratio'])),
                watch=[r for r in ok if r['watch'] and not r.get('type')],
+               sinfo=meta.get('sector_info') or {'status': 'none', 'fetched': ''},
                wname='自選股觀察' if list_mode else '觀察名單',
                wtitle='自選股：過第 2、3 關但型態未到' if list_mode else '觀察名單',
                pos=('總資金 %s 元、每筆風險 %s%%' % (format(int(capital), ','), risk_txt)) if capital else '未設定總資金，不試算部位')
@@ -1308,7 +1524,8 @@ def render_html(res, list_mode, meta):
 
 # ---------- 分享版（只含候選標的；可選擇公開到 GitHub Pages） ----------
 # 只複製這幾個欄位：新增欄位不會自動出現在分享版裡（寧可少放，不要多放）
-SHARE_FIELDS = ('code', 'name', 'type', 'close', 'chg', 'vol_ratio', 'stop', 'setup', 'stop_why')
+SHARE_FIELDS = ('code', 'name', 'type', 'close', 'chg', 'vol_ratio', 'stop', 'setup', 'stop_why', 'sector')
+SHARE_OPTIONAL = ('sector',)        # 舊資料沒有這些欄位時當作空字串
 SHARE_MA = ('ma20', 'boll_up', 'boll_lo')
 SHARE_CODE_RE = re.compile(r'[0-9]{4}[0-9A-Z]{0,2}')
 SHARE_HEAD = HTML_HEAD.replace('<title>', '<meta name="robots" content="noindex, nofollow">\n<title>', 1)
@@ -1337,7 +1554,7 @@ def share_rows(res):
         if 'error' in r or not r.get('type'):
             continue
         try:
-            row = {k: r[k] for k in SHARE_FIELDS}
+            row = {k: (r.get(k, '') if k in SHARE_OPTIONAL else r[k]) for k in SHARE_FIELDS}
         except KeyError as e:
             raise ValueError('分享版：候選標的缺少欄位 %s' % e.args[0])
         if not isinstance(row['code'], str) or not SHARE_CODE_RE.fullmatch(row['code']):
@@ -1347,6 +1564,8 @@ def share_rows(res):
         _share_text(row['name'], '名稱', 60)
         _share_text(row['setup'], '說明', 300)
         _share_text(row['stop_why'], '停損依據', 300)
+        if not isinstance(row['sector'], str) or (row['sector'] and row['sector'] not in SECTOR_LABELS):
+            raise ValueError('分享版：類股的內容不合規則')
         for k in ('close', 'chg', 'vol_ratio', 'stop'):
             if not _isnum(row[k]):
                 raise ValueError('分享版：「%s」不是有效的數字' % k)
@@ -1383,13 +1602,14 @@ def _share_help():
 <li>漲跌%：依台灣習慣，<span class="up">▲ 紅色是上漲</span>、<span class="down">▼ 綠色是下跌</span>，也都會寫正負號。</li>
 <li>停損距離：<span class="d-ok">近</span> 3% 以內，停損很近；<span class="d-mid">中</span> 3%～6%，普通；<span class="d-wide">遠</span> 超過 6%，停損很遠，一旦停損虧損會偏大。</li>
 <li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
-<li>頁面會跟著電腦或手機的淺色／深色設定切換；手機上表格會改成一張一張的卡片。</li>
+<li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成高股息、市值型、債券等；候選標的可以用「類股」選單篩選。</li>
+<li>頁面右上角可切換自動（跟著電腦或手機）／淺色／深色，選擇記在這個瀏覽器；無痕或封鎖網站資料時只在這次有效。手機上表格會改成一張一張的卡片。</li>
 </ul>
 <p class="cap14">本頁僅供程式與技術分析研究，不是投資建議，也不保證任何績效。資料可能延遲、缺漏或有誤，請以交易所公告為準。投資決定與後果由使用者自行承擔。</p>
 </div></section>"""
 
 
-def render_share_html(res):
+def render_share_html(res, sinfo=None):
     """分享版：只有今天的候選標的與關卡說明。不收任何 meta（總資金、路徑、產生時間…），同樣的資料一定產生同樣的位元組。
     不會修改 res；資料有不合規則的地方丟 ValueError。"""
     h = html.escape
@@ -1404,7 +1624,11 @@ def render_share_html(res):
     except ValueError:
         raise ValueError('分享版：資料日期不是有效的日期')
     nb = sum(1 for r in cands if r['type'] == '突破型')
-    ctx = dict(cands=cands)
+    sinfo = sinfo or {'status': 'none', 'fetched': ''}
+    if (not isinstance(sinfo, dict) or sinfo.get('status') not in ('none', 'ok', 'stale')
+            or not isinstance(sinfo.get('fetched'), str) or not re.fullmatch(r'|[0-9]{4}-[0-9]{2}-[0-9]{2}', sinfo['fetched'])):
+        raise ValueError('分享版：類股資料狀態不合規則')
+    ctx = dict(cands=cands, sinfo=sinfo)
     B = [_topnav(date) + '<main>']
     B.append('<header class="band alt" id="top"><div class="wrap stack">')
     B.append('<div class="stack" style="gap:8px"><h1><span class="nw">台股盤後選股</span> <span class="nw">%s</span></h1><p class="sub">%s</p></div>' % (
@@ -1414,6 +1638,7 @@ def render_share_html(res):
              '<div><dt>突破型</dt><dd>%d<small>檔</small></dd></div>'
              '<div><dt>回測型</dt><dd>%d<small>檔</small></dd></div></dl>' % (len(cands), nb, len(cands) - nb))
     B.append('<p class="cap14">分享版：只列出今天的候選標的與關卡說明。僅供研究，非投資建議。</p>')
+    B.extend(x for x in (_sec_stale(sinfo),) if x)
     B.append('<nav class="jump" aria-label="本頁段落"><a href="#cands">候選標的</a><a href="#help">怎麼看這一頁</a></nav>')
     B.append('</div></header>')
     _sec_cands(B, ctx, None, '', 0.02, placeholder='輸入代號或名稱')
@@ -1423,7 +1648,7 @@ def render_share_html(res):
 
 
 CSV_HEAD = ['代號', '名稱', '資料日期', '型態', '收盤', '漲跌%', '量比', '建議停損', '停損距離%', '股數(設定風險)', '金額(設定風險)',
-            '股數(5%)', '金額(5%)', '0週線', '1趨勢', '2動能', '3量能', 'A突破', 'B回測', '說明', '停損依據', '備註']
+            '股數(5%)', '金額(5%)', '0週線', '1趨勢', '2動能', '3量能', 'A突破', 'B回測', '說明', '停損依據', '備註', '類股']
 
 
 def write_csv(path, res, capital):
@@ -1444,10 +1669,10 @@ def write_csv(path, res, capital):
             w.writerow([f'="{r["code"]}"', r['name'], r['date'], r.get('type', ''), r['close'], r['chg'], r['vol_ratio'],
                         r.get('stop', ''), dist] + pos
                        + [yn(s[0]), yn(s[1]), yn(s[2]), yn(s[3]), yn(s['A']), yn(s['B']),
-                          r.get('setup', ''), r.get('stop_why', ''), '；'.join(r['notes'])])
+                          r.get('setup', ''), r.get('stop_why', ''), '；'.join(r['notes']), r.get('sector', '')])
         for r in res:
             if 'error' in r:
-                w.writerow([f'="{r["code"]}"', r['name']] + [''] * 19 + [r['error']])
+                w.writerow([f'="{r["code"]}"', r['name']] + [''] * 19 + [r['error'], r.get('sector', '')])
 
 
 # ---------- 指令 ----------
@@ -1502,10 +1727,10 @@ def _share_rules(share, cfg, capital, amounts, data_dir, out_dir, list_path=None
             except Exception:
                 pass
     return share.make_rules(capital=capital, amounts=amounts, paths=paths, watchlist=wl,
-                            repo=cfg['share_repo'] if cfg else None)
+                            repo=cfg['share_repo'] if cfg else None, sectors=SECTOR_LABELS)
 
 
-def build_share_page(res, o, a, tag, wl):
+def build_share_page(res, o, a, tag, wl, sinfo=None):
     """產生分享版並做安全檢查，通過才寫檔（回傳路徑）。不能產生或沒通過：不寫檔、刪掉同一天舊的分享版、
     印出原因，回傳 None。不影響選股結果。"""
     out_dir = o['out_dir']
@@ -1518,7 +1743,7 @@ def build_share_page(res, o, a, tag, wl):
     path = os.path.join(out_dir, f'分享版_{tag}.html')
     try:
         import share
-        data = render_share_html(res).encode('utf-8')
+        data = render_share_html(res, sinfo).encode('utf-8')
         amounts = [v for r in res for s in (r.get('size') or []) for v in (s['shares'], s['amount'])]
         rules = _share_rules(share, o['cfg'], o['capital'], amounts, a.data, out_dir, o['list'])
         problems = share.check_html(data, rules)
@@ -1556,6 +1781,8 @@ def cmd_scan(a):
         r = analyze(code, (wl or {}).get(code) or name, bars)
         size(r, capital, risk)
         res.append(r)
+    ind = load_industry(industry_dir(a.data))
+    attach_sectors(res, ind['rows'])
     missing = []
     if wl is not None:
         if not res:
@@ -1569,6 +1796,7 @@ def cmd_scan(a):
     md = report(res, wl is not None)
     valid = [r['date'] for r in res if 'error' not in r]
     tag = max(valid).replace('-', '') if valid else dt.date.today().strftime('%Y%m%d')
+    sinfo = sector_info(ind, max(valid) if valid else '')
 
     def target(explicit, ext):
         if explicit:
@@ -1587,12 +1815,13 @@ def cmd_scan(a):
         json.dump(res, open(json_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     if html_path:
         meta = dict(capital=capital, risk=risk, list_path=o['list'], list_count=len(wl) if wl else 0, missing=missing,
-                    today=dt.date.today().isoformat(), generated=dt.datetime.now().strftime('%Y-%m-%d %H:%M'))
+                    today=dt.date.today().isoformat(), generated=dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    sector_info=sinfo)
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(render_html(res, wl is not None, meta))
     if csv_path:
         write_csv(csv_path, res, capital)
-    share_path = build_share_page(res, o, a, tag, wl) if o['share'] else None
+    share_path = build_share_page(res, o, a, tag, wl, sinfo) if o['share'] else None
     if not md_path:
         sys.stdout.write(md)
     if any((html_path, csv_path, md_path, txt_path, json_path)):

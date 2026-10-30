@@ -12,7 +12,7 @@ screener.py 的 scan 會產生「分享版_<日期>.html」（只含今天的候
   14 GitHub 那邊出錯（連不上、被限速、沒有權限…）
   15 設定或儲存庫不符合條件
 """
-import base64, getpass, hashlib, html, json, os, re, shutil, socket, subprocess, sys, tempfile, time, unicodedata
+import base64, bisect, getpass, hashlib, html, json, os, re, shutil, socket, subprocess, sys, tempfile, time, unicodedata
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 
@@ -263,7 +263,7 @@ def _person_names(extra=()):
 CAPITAL_LABEL, AMOUNT_LABEL = '總資金的數字', '部位試算的股數或金額'
 
 
-def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, people=()):
+def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, people=(), sectors=()):
     """產生檢查規則：{'patterns': [(說明, 正規式)], 'values': {說明: {金額}}, 'watchlist': {代號: 名稱}}。
     比對的文字會先做 NFKC 正規化，所以這裡的值也都先正規化；不分大小寫的規則再做大小寫折疊。"""
     pats = []
@@ -324,7 +324,7 @@ def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, pe
     add('@import', r'@import', re.I)
     add('url( 外部資源', r'url\s*\(', re.I)
     wl = {_nf(str(k)).strip(): _nf(str(v or '')).strip() for k, v in (watchlist or {}).items() if _nf(str(k)).strip()}
-    return dict(patterns=pats, values=values, watchlist=wl)
+    return dict(patterns=pats, values=values, watchlist=wl, sectors=frozenset(_nf(str(x)) for x in sectors if x))
 
 
 ALLOWED_TAGS = {'html', 'head', 'meta', 'title', 'style', 'body', 'div', 'span', 'main', 'header', 'section', 'footer',
@@ -332,12 +332,13 @@ ALLOWED_TAGS = {'html', 'head', 'meta', 'title', 'style', 'body', 'div', 'span',
                 'thead', 'tbody', 'tr', 'th', 'td', 'fieldset', 'legend', 'label', 'input', 'select', 'option',
                 'button', 'script'}
 VOID_TAGS = {'meta', 'br', 'input'}
-ALLOWED_IDS = {'top', 'cands', 'cands-h', 'help', 'help-h', 'ct', 'cq', 'csort', 'cstatus', 'cnone'}
+ALLOWED_IDS = {'top', 'cands', 'cands-h', 'help', 'help-h', 'ct', 'cq', 'csort', 'cstatus', 'cnone', 'csec'}
+SECTOR_RE = re.compile(r'(?:ETF|[\u4e00-\u9fff]{1,8})(?:-[\u4e00-\u9fff]{1,8})?')     # 類股標籤：「航運」「科技-半導體」「ETF-債券」
 REQUIRED_IDS = ('cands', 'help')
 DATA_ATTRS = {'data-i', 'data-type', 'data-kind', 'data-code', 'data-name', 'data-close', 'data-chg', 'data-vr',
-              'data-stop', 'data-dist', 'data-label', 'data-key', 'data-num'}
+              'data-stop', 'data-dist', 'data-label', 'data-key', 'data-num', 'data-sec', 'data-set'}
 PLAIN_ATTRS = {'lang', 'aria-hidden', 'aria-label', 'aria-labelledby', 'aria-live', 'role', 'scope', 'colspan',
-               'for', 'autocomplete', 'placeholder', 'value', 'checked', 'hidden', 'selected'}
+               'for', 'autocomplete', 'placeholder', 'value', 'checked', 'hidden', 'selected', 'aria-pressed'}
 STYLE_RE = re.compile(r'(?:(?:left|width):-?[0-9]+(?:\.[0-9]+)?%;?|gap:8px;?)+')
 CLASS_RE = re.compile(r'[A-Za-z0-9 _-]*')
 META_OK = {('viewport', 'width=device-width, initial-scale=1'), ('color-scheme', 'light dark'),
@@ -351,6 +352,7 @@ class _Checker(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.problems, self.counts, self.ids = [], {}, set()
         self.cands, self.meta = [], set()
+        self.secs, self.in_head, self.head_scripts = set(), False, 0
 
     def bad(self, msg):
         if msg not in self.problems:
@@ -374,6 +376,10 @@ class _Checker(HTMLParser):
         if tag not in ALLOWED_TAGS:
             self.bad('頁面裡有不允許的標籤 <%s>' % tag[:20])
             return
+        if tag == 'head':
+            self.in_head = True
+        elif tag == 'script' and self.in_head:
+            self.head_scripts += 1
         amap = {}
         for k, v in attrs:
             amap[k] = v
@@ -388,6 +394,10 @@ class _Checker(HTMLParser):
             self.bad('<button> 的 type 只能是 button')
         if tag == 'tbody' and 'cand' in (amap.get('class') or '').split():
             self.cands.append((amap.get('data-code') or '', amap.get('data-name') or ''))
+
+    def handle_endtag(self, tag):
+        if tag == 'head':
+            self.in_head = False
 
     def check_meta(self, amap):
         keys = set(amap)
@@ -432,6 +442,16 @@ class _Checker(HTMLParser):
         elif k == 'data-code':
             if not CODE_RE.fullmatch(v or ''):
                 self.bad('data-code 不是股票代號的格式')
+        elif k == 'data-sec':
+            if v and not SECTOR_RE.fullmatch(v):
+                self.bad('data-sec 不是類股標籤的格式')
+            self.secs.add(v or '')
+        elif k == 'data-set':
+            if v not in ('auto', 'light', 'dark'):
+                self.bad('data-set 的值不合規則')
+        elif k == 'aria-pressed':
+            if v not in ('true', 'false'):
+                self.bad('aria-pressed 的值不合規則')
         elif k in DATA_ATTRS:
             if v is None or len(v) > 100 or CTRL_RE.search(v):
                 self.bad('%s 的內容不合規則' % k)
@@ -442,10 +462,36 @@ class _Checker(HTMLParser):
             self.bad('頁面裡有不允許的屬性（%s）' % re.sub(r'[^A-Za-z0-9_-]', '?', k)[:20])
 
 
+def _outside_labels(text, s, words):
+    """s 在 text 裡有沒有任何一次出現在「類股字詞」的範圍以外。只看包含 s 的字詞；沒有字詞包含 s 就等於 s in text"""
+    ws = [w for w in words if s in w]
+    if not ws:
+        return s in text
+    spans = []
+    for w in ws:
+        i = text.find(w)
+        while i >= 0:
+            spans.append((i, i + len(w)))
+            i = text.find(w, i + 1)
+    spans.sort()
+    starts, best, top = [], [], -1
+    for a, b in spans:
+        starts.append(a)
+        top = max(top, b)
+        best.append(top)
+    i = text.find(s)
+    while i >= 0:
+        k = bisect.bisect_right(starts, i)
+        if k == 0 or best[k - 1] < i + len(s):
+            return True
+        i = text.find(s, i + 1)
+    return False
+
+
 def _mask_watch_text(text, cand_codes, cand_names):
     text = re.sub(r'<style>.*?</style>', ' ', text, flags=re.S)
     text = re.sub(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', ' ', text)
-    text = re.sub(r'(?<![0-9])[0-9]++(?=\s*+檔)', ' ', text)      # 佔有量詞：很長的數字串也不會變慢
+    text = re.sub(r'(?<![0-9])[0-9]+(?=\s*檔)', ' ', text)      # 開頭有 (?<![0-9]) 擋住，不會從數字串中間重來，所以是線性的；不用佔有量詞（3.9／3.10 不支援）
     for s in sorted(set(cand_names) | set(cand_codes), key=len, reverse=True):
         if s:
             text = text.replace(s, ' ')
@@ -470,9 +516,14 @@ def inspect_html(data, rules):
     except Exception:
         ck.bad('頁面結構無法解析')
     problems += ck.problems
-    for tag in ('script', 'style', 'title'):
-        if ck.counts.get(tag, 0) != 1:
-            problems.append('<%s> 要剛好 1 個，現在是 %d 個' % (tag, ck.counts.get(tag, 0)))
+    for tag, want in (('script', 2), ('style', 1), ('title', 1)):
+        if ck.counts.get(tag, 0) != want:
+            problems.append('<%s> 要剛好 %d 個，現在是 %d 個' % (tag, want, ck.counts.get(tag, 0)))
+    if ck.head_scripts != 1:
+        problems.append('<head> 裡的 <script> 要剛好 1 個，現在是 %d 個' % ck.head_scripts)
+    allowed = rules.get('sectors') or ()
+    if allowed and any(x and x not in allowed for x in ck.secs):
+        problems.append('頁面裡有不在對照表裡的類股')
     for i in REQUIRED_IDS:
         if i not in ck.ids:
             problems.append('缺少必要的區塊（%s）' % i)
@@ -514,12 +565,14 @@ def inspect_html(data, rules):
         codes = [c for c, _ in ck.cands]
         names = [n for _, n in ck.cands]
         found = False
+        sec = rules.get('sectors') or ()
+        words = set(sec) | {x.split('-')[0] for x in sec if '-' in x}
         for text in _uniq([_mask_watch_text(un, codes, names),
                            _mask_watch_text(sq, [_nf(c) for c in codes], [_strip_cf(_nf(n)) for n in names])]):
             for code, name in wl.items():
                 if re.search(r'(?<![0-9A-Za-z.])' + re.escape(code) + r'(?![0-9A-Za-z]|\.[0-9])', text):
                     found = True
-                elif len(name) >= 2 and name not in names and _nf(name) not in [_nf(n) for n in names] and name in text:
+                elif len(name) >= 2 and name not in names and _nf(name) not in [_nf(n) for n in names] and _outside_labels(text, name, words):
                     found = True
         if found:
             problems.append('頁面裡出現了自選股清單裡、但不是今天候選標的的股票')

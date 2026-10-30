@@ -166,8 +166,9 @@ class TestShareRender(unittest.TestCase):
 
     def test_one_script_and_deterministic(self):
         a = make_page()
-        self.assertEqual(a.count('<script'), 1)
-        self.assertEqual(a.count('</script>'), 1)
+        self.assertEqual(a.count('<script'), 2)
+        self.assertEqual(a.count('</script>'), 2)
+        self.assertEqual(a[:a.index('</head>')].count('<script'), 1)
         self.assertEqual(a, make_page())
         self.assertEqual(a.encode('utf-8'), make_page().encode('utf-8'))
         self.assertEqual(a, make_page(capital=None))          # 總資金不影響分享頁的任何一個位元組
@@ -199,7 +200,7 @@ class TestShareRender(unittest.TestCase):
         page = make_page(tweak=tweak)
         self.assertNotIn('<img', page)
         self.assertNotIn('alert(2)</script>', page)
-        self.assertEqual(page.count('<script'), 1)
+        self.assertEqual(page.count('<script'), 2)
         self.assertIn('&lt;img', page)
 
     def test_many_candidates_under_limit(self):
@@ -213,7 +214,7 @@ class TestShareRender(unittest.TestCase):
 
     def test_full_render_unchanged(self):
         full = screener.render_html(tu.fake_results(), False, tu.meta_for())
-        self.assertEqual(full.count('<script'), 2)
+        self.assertEqual(full.count('<script'), 3)
         self.assertIn('placeholder="例如 2330 或 台積"', full)
         self.assertIn('id="watch"', full)
         self.assertIn('產生時間', full)
@@ -627,10 +628,11 @@ class TestScanShare(tu.TempCase):
         self.assertTrue(os.path.exists(p), err)
         raw = tu.readb(p)
         self.assertFalse(raw.startswith(b'\xef\xbb\xbf'))
-        self.assertEqual(share.check_html(raw, share.make_rules(capital=1000000, paths=[self.tmp, ROOT])), [])
+        self.assertEqual(share.check_html(raw, share.make_rules(capital=1000000, paths=[self.tmp, ROOT],
+                                                                 sectors=screener.SECTOR_LABELS)), [])
         self.assertNotIn(b'1000000', raw)
         self.assertIn('分享版：' + os.path.abspath(p), err)
-        self.assertEqual(raw.decode('utf-8'), make_page(tweak=lambda res: res.pop()))     # 和直接產生的一樣（少了 9999 那筆）
+        self.assertEqual(raw.decode('utf-8'), make_page(tweak=lambda res: (res.pop(), screener.attach_sectors(res, {}))))     # 和直接產生的一樣（少了 9999 那筆）
         self.assertFalse([n for n in os.listdir(out) if n.endswith('.tmp')])
 
     def test_share_publish_in_config_also_generates(self):
@@ -1446,6 +1448,127 @@ class TestShareStatic(unittest.TestCase):
         t = self.raw('.gitignore').decode('utf-8')
         self.assertIn('cache/', t)
         self.assertIn('結果/', t)
+
+
+# ---------- 類股在分享版 ----------
+def sec_page(sectors, status='ok', fetched='2026-10-20'):
+    res = tu.fake_results()
+    for r in res:
+        if 'date' in r:
+            r['date'] = '2026-10-22'
+        r['sector'] = sectors.get(r['code'], '')
+    return screener.render_share_html(res, {'status': status, 'fetched': fetched})
+
+
+class TestShareSector(unittest.TestCase):
+    def rules(self, **k):
+        d = dict(capital=1000000, paths=[ROOT], sectors=screener.SECTOR_LABELS)
+        d.update(k)
+        return share.make_rules(**d)
+
+    def test_page_structure_and_scripts(self):
+        page = sec_page({'1101': '傳產-水泥', '2330': '科技-半導體', '00646': 'ETF-市值型'})
+        self.assertEqual(share.check_html(page.encode('utf-8'), self.rules()), [])
+        head = page[:page.index('</head>')]
+        self.assertEqual((page.count('<script'), head.count('<script')), (2, 1))
+        for s in ('id="csec"', 'data-sec="科技-半導體"', 'data-set="dark"', 'aria-pressed="true"', 'role="group"', '類股：'):
+            self.assertIn(s, page, s)
+        self.assertIn('csec', screener.SHARE_JS)
+        self.assertIn('twss-theme', screener.SHARE_JS)
+        self.assertIn('setTheme', screener.SHARE_JS)
+
+    def test_structure_violations(self):
+        page = sec_page({'1101': '傳產-水泥'})
+        boot = '<script>' + screener.THEME_BOOT + '</script>\n'
+        self.assertIn(boot, page)
+        cases = {
+            'head script moved to body': page.replace(boot, '', 1).replace('</body>', boot + '</body>'),
+            'third script': page.replace('</body>', '<script>var a=1;</script></body>'),
+            'no head script': page.replace(boot, '', 1),
+            'aria-pressed bad': page.replace('data-set="auto" aria-pressed="true"', 'data-set="auto" aria-pressed="yes"', 1),
+            'data-set bad': page.replace('data-set="auto"', 'data-set="x"', 1),
+            'data-sec path': page.replace('data-sec="傳產-水泥"', 'data-sec="C:/x"', 1),
+            'data-sec name': page.replace('data-sec="傳產-水泥"', 'data-sec="鴻海"', 1),
+            'data-sec html': page.replace('data-sec="傳產-水泥"', 'data-sec="a&lt;b"', 1),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self.assertTrue(share.check_html(bad.encode('utf-8'), self.rules()), name)
+        fmt_only = page.replace('data-sec="傳產-水泥"', 'data-sec="鴻海"', 1).encode('utf-8')
+        self.assertEqual(share.check_html(fmt_only, share.make_rules(capital=1000000, paths=[ROOT])), [])    # 沒給清單時只看格式
+
+    def test_every_label_page_under_limit(self):
+        res = []
+        for i, label in enumerate(screener.SECTOR_ORDER):
+            r = tu.fake_rec('%04d' % (3000 + i), '測試%s' % '甲乙丙丁戊己庚辛壬癸'[i % 10], 100.0 + i, 1.0, 2.0, '突破型', 95.0 + i)
+            r['sector'] = label
+            res.append(r)
+        page = screener.render_share_html(res, {'status': 'ok', 'fetched': '2026-10-20'}).encode('utf-8')
+        self.assertLess(len(page), share.MAX_BYTES)
+        self.assertEqual(share.check_html(page, self.rules()), [])
+        for label in screener.SECTOR_ORDER:
+            self.assertIn(('data-sec="%s"' % label).encode('utf-8'), page)
+
+    def test_watchlist_name_equal_to_label_word(self):
+        wl = {'1234': '半導體'}
+        ok = sec_page({'1101': '科技-半導體'}).encode('utf-8')
+        self.assertEqual(share.check_html(ok, self.rules(watchlist=wl)), [])
+        bad = sec_page({'1101': '科技-半導體'}).replace('<main>', '<main><p>半導體</p>', 1).encode('utf-8')
+        self.assertTrue(share.check_html(bad, self.rules(watchlist=wl)))
+        bad2 = sec_page({'1101': '航運'}).replace('<main>', '<main><p>長榮航運</p>', 1).encode('utf-8')
+        self.assertTrue(share.check_html(bad2, self.rules(watchlist={'1234': '長榮航運'})))
+        bad3 = sec_page({}).replace('<main>', '<main><p>半導體</p>', 1).encode('utf-8')
+        self.assertTrue(share.check_html(bad3, self.rules(watchlist=wl)))
+
+    def test_outside_labels(self):
+        f = share._outside_labels
+        words = {'科技-半導體', '科技', '航運'}
+        self.assertFalse(f('x 科技-半導體 y', '半導體', words))
+        self.assertTrue(f('x 科技-半導體 半導體', '半導體', words))
+        self.assertTrue(f('長榮航運', '長榮航運', words))
+        self.assertFalse(f('<p>航運</p>', '航運', words))
+        self.assertTrue(f('abc 鴻海', '鴻海', words))
+        self.assertFalse(f('abc', '鴻海', words))
+
+    def test_share_rows_sector_validation(self):
+        res = tu.fake_results()
+        for bad in ('鴻海', 5, None, '科技-半導體 ', 'ETF'):
+            res[0]['sector'] = bad
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                screener.share_rows(res)
+        res[0]['sector'] = '航運'
+        self.assertIn('航運', [r['sector'] for r in screener.share_rows(res)])
+        del res[0]['sector']
+        self.assertTrue(all(r['sector'] == '' for r in screener.share_rows(res)))
+        with self.assertRaises(ValueError):
+            screener.render_share_html(res, {'status': 'weird', 'fetched': ''})
+        with self.assertRaises(ValueError):
+            screener.render_share_html(res, {'status': 'ok', 'fetched': '2026/10/20'})
+        self.assertEqual(screener.render_share_html(res, None),
+                         screener.render_share_html(res, {'status': 'none', 'fetched': ''}))
+
+    def test_stale_note_in_share(self):
+        page = sec_page({'1101': '傳產-水泥'}, status='stale', fetched='2026-09-01')
+        self.assertIn('類股資料未更新（上次更新 2026-09-01）', page)
+        self.assertEqual(share.check_html(page.encode('utf-8'), self.rules()), [])
+
+    def test_python39_compatible(self):
+        import ast
+        for f in ('screener.py', 'share.py', 'fetch_data.py'):
+            with open(os.path.join(ROOT, f), encoding='utf-8') as fh:
+                src = fh.read()
+            ast.parse(src, feature_version=(3, 9))
+        with open(os.path.join(ROOT, 'share.py'), encoding='utf-8') as fh:
+            src = fh.read()
+        self.assertNotIn(']++', src)             # 佔有量詞要 Python 3.11 才有
+        self.assertNotIn('*+檔', src)
+
+    def test_adversarial_mask_is_fast(self):
+        import time
+        for text in ('1' * 300000, '1 ' * 150000, '1' * 150000 + ' ' * 150000, ('1' + ' ' * 50) * 5000 + 'x'):
+            t0 = time.time()
+            share._mask_watch_text(text, [], [])
+            self.assertLess(time.time() - t0, 3, text[:10])
 
 
 if __name__ == '__main__':
