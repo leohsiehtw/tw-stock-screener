@@ -39,7 +39,7 @@ DIR 內每檔股票一個檔案，檔名 <代號>.json 或 <代號>.csv：
     B 回測型（需過 0～1 關，不看 2、3 關）：沿月線爬升、量縮回測 MA20 附近止跌
 停損：突破型取「突破長紅 K 低點」與「MA20」中較高者；回測型取 MA20 與當日低點中較低者。
 """
-import argparse, csv, datetime as dt, html, io, json, math, os, pathlib, re, sys, traceback
+import argparse, csv, datetime as dt, html, io, json, math, os, pathlib, re, sys, traceback, unicodedata
 
 # 參數集中在這裡，要調整門檻改這裡就好
 P = dict(
@@ -1321,8 +1321,11 @@ def _isnum(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+SHARE_BAD_CATS = {'Cc', 'Cf', 'Co', 'Cs', 'Cn', 'Zl', 'Zp'}     # 控制、格式（零寬、方向控制）、私用、未定義、行／段分隔
+
+
 def _share_text(v, label, limit):
-    if not isinstance(v, str) or len(v) > limit or any(ord(c) < 32 or ord(c) == 127 for c in v):
+    if not isinstance(v, str) or len(v) > limit or any(unicodedata.category(c) in SHARE_BAD_CATS for c in v):
         raise ValueError('分享版：「%s」的內容不合規則' % label)
     return v
 

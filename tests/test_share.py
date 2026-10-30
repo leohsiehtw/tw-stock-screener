@@ -421,6 +421,140 @@ class TestLeakCheck(unittest.TestCase):
         self.assertEqual(share.check_html(self.inject('<p>5000</p>'), rules), [])
         self.assertTrue(share.check_html(self.inject('<p>capital=5000</p>'), rules))
 
+    # v1.1.5：Unicode 正規化（NFKC）、中文數字、零寬字元
+    HOSTILE = [   # (名稱, 寫法, make_rules 的參數；None = 用預設的 capital=1000000)
+        ('full-width digits', '１０００００００', dict(capital=10000000)),
+        ('full-width wan', '１００萬', None),
+        ('space sep', '1 000 000', None),
+        ('nbsp sep', '1 000 000', None),
+        ('thin space sep', '1 000 000', None),
+        ('ideographic space sep', '1　000　000', None),
+        ('underscore sep', '1_000_000', None),
+        ('comma decimals', '1,000,000.00', None),
+        ('dot thousands', '1.000.000', None),
+        ('trailing .00', '1000000.00', None),
+        ('sci 1.0e6', '1.0e6', None),
+        ('sci 1e6', '1e6', None),
+        ('sci E+06', '1E+06', None),
+        ('cn 一百萬', '一百萬', None),
+        ('cn 壹佰萬', '壹佰萬', None),
+        ('cn 兩百萬', '兩百萬', dict(capital=2000000)),
+        ('cn 二百五十萬', '二百五十萬', dict(capital=2500000)),
+        ('cn 一千萬', '一千萬', dict(capital=10000000)),
+        ('arabic 1,000萬', '1,000萬', dict(capital=10000000)),
+        ('arabic 1百萬', '1百萬', None),
+        ('cn 一百二十三萬四千五百', '一百二十三萬四千五百', dict(capital=1234500)),
+        ('cn 一億', '一億', dict(capital=100000000)),
+        ('cn 零', '一百萬零五百', dict(capital=1000500)),
+        ('cn 〇', '一〇〇〇〇〇〇', None),
+        ('amount full-width comma', '５０，０００', None),
+        ('amount cn', '五萬', None),
+        ('amount spaced', '1 234 567', None),
+        ('full-width email', 'bobby＠example.com', None),
+        ('full-width drive path', 'Ｃ：＼Ｕｓｅｒｓ＼x', None),
+        ('full-width config key', 'ｃａｐｉｔａｌ＝5', None),
+        ('full-width url', 'ｈｔｔｐｓ：／／evil.example', None),
+    ]
+    INVISIBLE = [   # 含零寬或格式字元：share_rows 會先拒絕，直接放進頁面也要擋
+        ('zero-width split digits', '1000​000', None),
+        ('word joiner digits', '1⁠000⁠000', None),
+        ('soft hyphen digits', '1­000­000', None),
+        ('zero-width split word', '部​位', None),
+        ('bom split key', 'capi﻿tal=5', None),
+    ]
+
+    def assert_flagged(self, name, secret, probs):
+        self.assertTrue(probs, name)
+        joined = '\n'.join(probs)
+        for part in {secret, share._nf(secret), share._strip_cf(share._nf(secret))}:
+            if len(part) >= 3:
+                self.assertNotIn(part, joined, name)
+
+    def test_unicode_and_numeral_forms_blocked_in_every_field(self):
+        for name, secret, kw in self.HOSTILE:
+            rules = self.rules(**(kw or {}))
+            self.assertEqual(share.check_html(self.page.encode('utf-8'), rules), [], name)
+            for field in ('name', 'setup', 'stop_why'):
+                with self.subTest(name, field=field):
+                    page = make_page(tweak=lambda res, f=field, s=secret: res[0].update({f: '台泥 ' + s + ' 收紅'}))
+                    self.assert_flagged(name, secret, share.check_html(page.encode('utf-8'), rules))
+            with self.subTest(name, field='crafted html'):
+                self.assert_flagged(name, secret, share.check_html(self.inject('<p>看 %s 這裡</p>' % secret), rules))
+
+    def test_invisible_characters_blocked(self):
+        for name, secret, kw in self.INVISIBLE:
+            rules = self.rules(**(kw or {}))
+            for field in ('name', 'setup', 'stop_why'):
+                with self.subTest(name, field=field):
+                    with self.assertRaises(ValueError):
+                        make_page(tweak=lambda res, f=field, s=secret: res[0].update({f: '台泥' + s}))
+            with self.subTest(name, field='crafted html'):
+                probs = share.check_html(self.inject('<p>看 %s 這裡</p>' % secret), rules)
+                self.assert_flagged(name, secret, probs)
+                self.assertTrue(any('控制字元' in p for p in probs), probs)
+                self.assertGreaterEqual(len(probs), 2, probs)      # 除了控制字元，內容本身也被認出來
+
+    def test_share_rows_rejects_format_and_control_chars(self):
+        for ch in ('​', '‌', '‍', '⁠', '﻿', '­', '‮', '‪', '⁦', '⁩',
+                   '‎', '؜', '', '\U000f0000', '͸', ' ', ' ', '\x85', '\x1b', '\x7f'):
+            for field in ('name', 'setup', 'stop_why'):
+                with self.subTest(hex(ord(ch)), field=field):
+                    with self.assertRaises(ValueError):
+                        make_page(tweak=lambda res, f=field, c=ch: res[0].update({f: '台' + c + '泥'}))
+            with self.subTest(hex(ord(ch)), field='crafted html'):
+                probs = share.check_html(self.inject('<p>a%sb</p>' % ch), share.make_rules(capital=None))
+                self.assertTrue(any('控制字元' in p for p in probs), probs)
+        # 一般的全形字、全形空白、表情以外的常見符號照樣可以用
+        page = make_page(tweak=lambda res: res[0].update(name='台泥　Ａ－１', setup='量比 ２．４，收紅 ▲'))
+        self.assertEqual(share.check_html(page.encode('utf-8'), self.rules()), [])
+
+    def test_unicode_negatives_not_flagged(self):
+        rules = self.rules(capital=1000000, amounts=[50000, 1234567])
+        cases = ['2385', '1234.5', '1000', '1 000', '100000', '2026-10-22', '2026/10/22', '共 2301 檔', '一百檔', '十大',
+                 '三十萬', '十萬', '一百二十三萬', '五百萬', '一千', '一億', '百萬', '千萬別追高', '萬海', '一張一張', '二〇二六年',
+                 '1e3', '2e6', '12.345', '50.000', '收盤 23，500', '量比 1.5，500 張', '0.1000000', '1000000.5',
+                 '1000.000', '21000000', '12345678', 'MA20 1000', '第 1 關 000', '１２３４．５',
+                 '一百二十三萬四千', 'Ｃ＃', '５０％', 'ａｂｃ＠ｘ']
+        for s in cases:
+            for field in ('name', 'setup', 'stop_why'):
+                with self.subTest(s, field=field):
+                    page = make_page(tweak=lambda res, f=field, v=s: res[0].update({f: '台泥 ' + v}))
+                    self.assertEqual(share.check_html(page.encode('utf-8'), rules), [], s)
+        # CSS 的數字（rgba、逗號）不算千分位，也不是金額
+        css = self.page.replace('</style>', 'a{box-shadow:0 1px 2px rgba(255,255,255,.08);font:600 15px/1.4 x;margin:1,000px}</style>', 1)
+        self.assertNotEqual(css, self.page)
+        self.assertEqual(share.check_html(css.encode('utf-8'), rules), [])
+        # 中文數字和設定的金額無關：不擋
+        self.assertEqual(share.check_html(self.inject('<p>一百萬</p>'), self.rules(capital=2000000)), [])
+        self.assertEqual(share.check_html(self.inject('<p>1 000 000</p>'), self.rules(capital=2000000)), [])
+
+    def test_cn_numeral_parser(self):
+        last = lambda s: list(share._cn_values(s))[-1]
+        for s, v in (('一百二十三萬四千五百', 1234500), ('一億', 10 ** 8), ('壹佰萬', 10 ** 6), ('二百五十萬', 2500000),
+                     ('一〇〇〇〇〇〇', 10 ** 6), ('十萬', 100000), ('一千零五', 1005), ('3萬4千', 34000), ('兩百萬', 2 * 10 ** 6),
+                     ('一億二千萬', 120000000), ('1百萬', 10 ** 6), ('十大', 10), ('一百檔', 100), ('萬', 0), ('百萬', 0),
+                     ('贰佰万', 2 * 10 ** 6), ('叁亿', 3 * 10 ** 8)):
+            self.assertEqual(last(s.replace('檔', '').replace('大', '')), v, s)
+        self.assertEqual(list(share._cn_values('萬' * 10000))[-1], 0)
+        self.assertLess(len(list(share._cn_values('九億' * 50))), 50)       # 太大就停
+
+    def test_leak_check_speed_on_300kb_adversarial_input(self):
+        import time
+        rules = self.rules(amounts=list(range(10000, 10060)) + [1234567])
+        n = share.MAX_BYTES - len(self.page.encode('utf-8'))
+        cases = {'a@': 'a@' * (n // 2), 'digits': '1' * n, 'digit space': '1 ' * (n // 2), 'digit comma': '1,' * (n // 2),
+                 'digit dot': '1.' * (n // 2), 'long spaces': '1' + ' ' * (n - 2) + '1', 'cn': '一' * (n // 3),
+                 'wan': '萬' * (n // 3), 'cn mix': '一百萬1' * (n // 12), 'a.': 'a.' * (n // 2), 'zero width': '1​' * (n // 4),
+                 'e': '1e' * (n // 2), 'entities': '&#49;' * (n // 5), 'full-width': '１' * (n // 3), '000 ': '000 ' * (n // 4),
+                 'slashes': '/' * n, 'users': '/users/' * (n // 7), 'digits then 檔': '1' * (n - 3) + '檔'}
+        for name, text in cases.items():
+            with self.subTest(name):
+                data = self.inject('<p>%s</p>' % text)
+                t = time.perf_counter()
+                probs = share.check_html(data, rules)
+                self.assertLess(time.perf_counter() - t, 3.0, name)
+                self.assertIsInstance(probs, list)
+
     def test_unit_helpers(self):
         self.assertEqual(share.blob_sha(b'hello\n'), 'ce013625030ba8dba906f756967f9e9ca394464a')
         self.assertEqual(share.pages_url('YourName', 'res'), 'https://yourname.github.io/res/')

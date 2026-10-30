@@ -12,7 +12,8 @@ screener.py 的 scan 會產生「分享版_<日期>.html」（只含今天的候
   14 GitHub 那邊出錯（連不上、被限速、沒有權限…）
   15 設定或儲存庫不符合條件
 """
-import base64, getpass, hashlib, html, json, os, re, shutil, socket, subprocess, sys, tempfile, time
+import base64, getpass, hashlib, html, json, os, re, shutil, socket, subprocess, sys, tempfile, time, unicodedata
+from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 
 E_CONFIRM, E_GH_MISSING, E_GH_AUTH, E_LEAK, E_GITHUB, E_SHARE = 10, 11, 12, 13, 14, 15
@@ -74,13 +75,172 @@ def _isatty():
 
 
 # ---------- 安全檢查 ----------
-def _forms(n):
-    n = int(n)
-    return [str(n), format(n, ','), '%d.0' % n]
+def _nf(s):
+    """Unicode 正規化（NFKC）：全形英數與符號、相容字元都換成一般寫法（１→1、＠→@、：→:）"""
+    return unicodedata.normalize('NFKC', s)
 
 
-def _numpat(s):
-    return r'(?<![0-9,.])' + re.escape(s) + r'(?![0-9,]|\.[0-9])'
+def _fold(s):
+    """NFKC＋大小寫折疊，給不分大小寫的規則用"""
+    return _nf(_nf(s).casefold())
+
+
+def _strip_cf(s):
+    """拿掉看不見的格式字元（類別 Cf：零寬字元 U+200B～U+200D、U+2060、U+FEFF、軟連字號 U+00AD、方向控制…）"""
+    bad = {ord(c): None for c in set(s) if unicodedata.category(c) == 'Cf'}
+    return s.translate(bad) if bad else s
+
+
+ODD_CATS = {'Cf', 'Co', 'Cs', 'Cn', 'Zl', 'Zp'}
+
+
+def _odd_chars(s):
+    """看不見或不該出現的字元：格式字元、私用區、未定義、行／段分隔符號，以及 \\t \\n \\r 以外的控制字元"""
+    return any(unicodedata.category(c) in ODD_CATS or (unicodedata.category(c) == 'Cc' and c not in '\t\n\r')
+               for c in set(s))
+
+
+def _uniq(xs):
+    out = []
+    for x in xs:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+# 中文數字（NFKC 之後的寫法；含大寫與簡體的萬、億）
+CN_DIGITS = dict(zip('零一二三四五六七八九', range(10)))
+CN_DIGITS.update({'〇': 0, '兩': 2, '两': 2, '壹': 1, '貳': 2, '贰': 2, '參': 3, '叄': 3, '叁': 3, '肆': 4, '伍': 5, '陸': 6, '陆': 6,
+                  '柒': 7, '捌': 8, '玖': 9})
+CN_SMALL = {'十': 10, '拾': 10, '百': 100, '佰': 100, '千': 1000, '仟': 1000}
+CN_BIG = {'萬': 10 ** 4, '万': 10 ** 4, '億': 10 ** 8, '亿': 10 ** 8}
+CN_CHARS = ''.join(CN_DIGITS) + ''.join(CN_SMALL) + ''.join(CN_BIG)
+_KK = '[%s](?:[^\\S\\r\\n]{0,2}[%s])*' % (CN_CHARS, CN_CHARS)
+CN_RUN_RE = re.compile('(?:(?<![0-9.,])[0-9]+)?%s(?:[0-9]+%s)*(?:[0-9]+(?![0-9]|[.,][0-9]))?' % (_KK, _KK))
+CN_TOKEN_RE = re.compile(r'[0-9]+|\S')
+DIGIT_RUN_RE = re.compile(r'[0-9]+(?:(?:[,.]\s?|[\s_]{1,3})[0-9]+)*')
+BLANK_RE = re.compile(r'[\s_]+')
+SCI_RE = re.compile(r'(?<![0-9A-Za-z#._-])([0-9]+(?:\.[0-9]+)?)[eE]\+?([0-9]{1,2})(?![0-9A-Za-z])')
+UNIT_RE = re.compile(r'(?<![0-9.,])([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)\s{0,3}(?:([百佰千仟])\s{0,3})?([萬万億亿])')
+CTX_MASK_RE = re.compile(r'[\d%s]' % CN_CHARS)
+_CN_LIMIT = 10 ** 16
+
+
+def _cn_values(run):
+    """把一段中文數字（可夾阿拉伯數字，例如 100萬、3萬4千）換成整數。每讀一個字就產生一次目前的值
+    （一百二十三萬四千五百 → …、1230000、…、1234500），所以後面多接的字不會讓前面的金額漏掉。"""
+    total = section = 0
+    num, prev = None, None
+    for tok in CN_TOKEN_RE.findall(run):
+        if tok[0].isdigit():
+            if len(tok) > 16:
+                return
+            num, prev = int(tok), 'a'
+        elif tok in CN_DIGITS:
+            d = CN_DIGITS[tok]
+            if prev == 'd':
+                num = num * 10 + d                  # 一〇〇〇〇〇〇 這種逐位寫法
+            elif prev == 'a':
+                total = section = 0                 # 阿拉伯數字後面直接接中文數字：當作另一個數
+                num = d
+            else:
+                num = d
+            prev = 'd'
+        elif tok in CN_SMALL:
+            u = CN_SMALL[tok]
+            section += (num if num is not None else (1 if u == 10 else 0)) * u
+            num, prev = None, 'u'
+        elif tok in CN_BIG:
+            if CN_BIG[tok] == 10 ** 8:
+                total = (total + section + (num or 0)) * 10 ** 8
+            else:
+                total += (section + (num or 0)) * 10 ** 4
+            section, num, prev = 0, None, 'u'
+        else:
+            continue
+        cur = total + section + (num or 0)
+        if cur > _CN_LIMIT:
+            return
+        yield cur
+
+
+def _digit_hits(t, targets):
+    """找出寫成 1 000 000、1_000_000、1,000,000、1.000.000、1000000.00 的數字（目標值的數字串完全一樣、前後不接別的數字）。
+    逗號、點只能在千分位上（點要至少兩個、每段 3 位），空白與底線可以在任何位置。回傳 [(值, 位置)]"""
+    if not targets:
+        return []
+    strs = {str(v): v for v in targets}
+    prefixes = {s[:i] for s in strs for i in range(1, len(s) + 1)}
+    out = []
+    for m in DIGIT_RUN_RE.finditer(t):
+        parts = re.split(r'([^0-9]+)', m.group())
+        g, s = parts[0::2], parts[1::2]
+        n = len(g)
+        pos = [m.start()]
+        for i in range(n - 1):
+            pos.append(pos[-1] + len(g[i]) + len(s[i]))
+        for k in range(n):
+            if k and not BLANK_RE.fullmatch(s[k - 1]):
+                continue                            # 前面是逗號或點：是更大的數字的一部分
+            cur, dots, other, len3 = '', 0, 0, True
+            for j in range(k, n):
+                if j > k:
+                    sep = s[j - 1]
+                    if ',' in sep:
+                        if len(g[j]) != 3:
+                            break
+                        other += 1
+                    elif '.' in sep:
+                        if sep != '.':
+                            break
+                        dots += 1
+                    else:
+                        other += 1
+                    len3 = len3 and len(g[j]) == 3
+                cur += g[j]
+                if cur not in prefixes:
+                    break
+                if cur not in strs:
+                    continue
+                if dots and not (dots >= 2 and not other and len3 and len(g[k]) <= 3):
+                    continue
+                if j < n - 1:
+                    nxt = s[j]
+                    if ',' in nxt or '.' in nxt:
+                        tail_ok = (nxt == '.' and not dots and not g[j + 1].strip('0')
+                                   and (j + 1 == n - 1 or BLANK_RE.fullmatch(s[j + 1])))
+                        if not tail_ok:
+                            continue
+                out.append((strs[cur], pos[k]))
+    return out
+
+
+def _value_hits(t, targets):
+    """所有寫法的金額：分隔符號、科學記號（1e6）、阿拉伯數字＋萬／億（1,000萬、0.01億）、中文數字（一百萬、壹佰萬）"""
+    if not targets:
+        return []
+    out = _digit_hits(t, targets)
+    for m in SCI_RE.finditer(t):
+        try:
+            v = Decimal(m.group(1)).scaleb(int(m.group(2)))
+        except (InvalidOperation, ValueError):
+            continue
+        if v == v.to_integral_value() and int(v) in targets:
+            out.append((int(v), m.start()))
+    for m in UNIT_RE.finditer(t):
+        try:
+            v = Decimal(m.group(1).replace(',', ''))
+        except InvalidOperation:
+            continue
+        v *= (CN_SMALL[m.group(2)] if m.group(2) else 1) * CN_BIG[m.group(3)]
+        if v == v.to_integral_value() and int(v) in targets:
+            out.append((int(v), m.start()))
+    for m in CN_RUN_RE.finditer(t):
+        for v in _cn_values(m.group()):
+            if v in targets:
+                out.append((v, m.start()))
+                break
+    return sorted(out, key=lambda x: x[1])
 
 
 def _person_names(extra=()):
@@ -94,23 +254,27 @@ def _person_names(extra=()):
             pass
     out = []
     for n in names:
-        n = (n or '').strip()
-        if len(n) >= 2 and n.lower() not in [x.lower() for x in out]:
+        n = _fold((n or '').strip())
+        if len(n) >= 2 and n not in out:
             out.append(n)
     return out
 
 
+CAPITAL_LABEL, AMOUNT_LABEL = '總資金的數字', '部位試算的股數或金額'
+
+
 def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, people=()):
-    """產生檢查規則：{'patterns': [(說明, 正規式)], 'watchlist': {代號: 名稱}}"""
+    """產生檢查規則：{'patterns': [(說明, 正規式)], 'values': {說明: {金額}}, 'watchlist': {代號: 名稱}}。
+    比對的文字會先做 NFKC 正規化，所以這裡的值也都先正規化；不分大小寫的規則再做大小寫折疊。"""
     pats = []
+    values = {CAPITAL_LABEL: set(), AMOUNT_LABEL: set()}
 
     def add(label, pattern, flags=0):
         pats.append((label, re.compile(pattern, flags)))
 
     if capital and capital >= 10000:
         c = int(capital)
-        for s in _forms(c):
-            add('總資金的數字', _numpat(s))
+        values[CAPITAL_LABEL].add(c)          # 1000000、1,000,000、1 000 000、1e6、一百萬…都由 _value_hits 找
         wan = str(c // 10000) if c % 10000 == 0 else format(c / 10000, '.10g')
         add('總資金的數字（萬）', r'(?<![0-9,.])' + re.escape(wan) + r'\s*萬')
         add('總資金的數字（億）', r'(?<![0-9,.])' + re.escape(format(c / 1e8, '.10g')) + r'\s*億')
@@ -122,18 +286,17 @@ def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, pe
             continue
         if n >= 10000 and n not in seen:
             seen.add(n)
-            for s in _forms(n):
-                add('部位試算的股數或金額', _numpat(s))
+            values[AMOUNT_LABEL].add(n)
     add('有千分位逗號的數字（可能是金額）', r'(?<![0-9,])[0-9]{1,3}(?:,[0-9]{3})+(?![0-9])')
     forms = set()
     for p in paths or ():
-        p = str(p or '').strip()
+        p = _fold(str(p or '').strip())
         if not p:
             continue
         for q in {p, p.rstrip('\\/')}:
             for f in (q, q.replace('/', '\\'), q.replace('\\', '/'), q.replace('\\', '\\\\')):
                 forms.add(f)
-                if re.match(r'[A-Za-z]:', f):
+                if re.match(r'[a-z]:', f):
                     forms.add(f[2:])
     for f in sorted(forms, key=len, reverse=True):
         if len(f) >= 4:
@@ -145,10 +308,11 @@ def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, pe
     for k in CONFIG_KEY_NAMES:
         add('設定檔的項目（%s=）' % k, r'(?<![A-Za-z0-9_-])' + k + r'\s*[=＝]', re.I)
     for w in FORBIDDEN_WORDS:
-        add('不該出現的詞（%s）' % w, re.escape(w))
+        add('不該出現的詞（%s）' % w, re.escape(_nf(w)))
     for n in _person_names(people):
         add('電腦或使用者名稱', r'(?<![A-Za-z0-9_-])' + re.escape(n) + r'(?![A-Za-z0-9_-])', re.I)
     if repo:
+        repo = _fold(repo)
         add('GitHub 儲存庫名稱', re.escape(repo), re.I)
         owner = repo.split('/')[0]
         if len(owner) >= 4:
@@ -159,8 +323,8 @@ def make_rules(capital=None, amounts=(), paths=(), watchlist=None, repo=None, pe
     add('data: 連結', r'(?<![A-Za-z0-9_-])data\s*:', re.I)
     add('@import', r'@import', re.I)
     add('url( 外部資源', r'url\s*\(', re.I)
-    wl = {str(k).strip(): str(v or '').strip() for k, v in (watchlist or {}).items() if str(k).strip()}
-    return dict(patterns=pats, watchlist=wl)
+    wl = {_nf(str(k)).strip(): _nf(str(v or '')).strip() for k, v in (watchlist or {}).items() if _nf(str(k)).strip()}
+    return dict(patterns=pats, values=values, watchlist=wl)
 
 
 ALLOWED_TAGS = {'html', 'head', 'meta', 'title', 'style', 'body', 'div', 'span', 'main', 'header', 'section', 'footer',
@@ -281,7 +445,7 @@ class _Checker(HTMLParser):
 def _mask_watch_text(text, cand_codes, cand_names):
     text = re.sub(r'<style>.*?</style>', ' ', text, flags=re.S)
     text = re.sub(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', ' ', text)
-    text = re.sub(r'[0-9]+(?=\s*檔)', ' ', text)
+    text = re.sub(r'(?<![0-9])[0-9]++(?=\s*+檔)', ' ', text)      # 佔有量詞：很長的數字串也不會變慢
     for s in sorted(set(cand_names) | set(cand_codes), key=len, reverse=True):
         if s:
             text = text.replace(s, ' ')
@@ -317,33 +481,47 @@ def inspect_html(data, rules):
     if DISCLAIMER not in raw:
         problems.append('缺少免責聲明「%s」' % DISCLAIMER)
     info['cands'] = len(ck.cands)
-    texts = [raw]
+    if _odd_chars(raw):
+        problems.append('頁面裡有看不見的控制字元（零寬字元、方向控制、私用區或未定義的字元）')
+    # 比對用的幾種寫法：原文、解開 &#…; 之後、NFKC 正規化（全形→半形）、再拿掉零寬字元、再做大小寫折疊
     un = html.unescape(raw)
-    if un != raw:
-        texts.append(un)
+    sq = _strip_cf(_nf(un))
+    texts = _uniq([raw, un, _nf(un), sq, _nf(sq.casefold())])
+    # 千分位規則：中文的全形逗號「，」正規化後會變成「,」，這條規則不把它當成千分位
+    thou = _uniq([raw, un, _strip_cf(_nf(un.replace('，', '、')))])
     done = set()
+
+    def hit(label, t, start):
+        done.add(label)
+        ctx = CTX_MASK_RE.sub('#', t[max(0, start - 15):start].replace('\n', ' ').replace('\r', ' '))
+        problems.append('%s（在「…%s」的後面）' % (label, ctx) if ctx.strip() else label)
+
     for label, rx in rules['patterns']:
         if label in done:
             continue
-        for t in ([re.sub(r'<style>.*?</style>', ' ', x, flags=re.S) for x in texts] if label in NOSTYLE_LABELS else texts):
+        for t in ([re.sub(r'<style>.*?</style>', ' ', x, flags=re.S) for x in thou] if label in NOSTYLE_LABELS else texts):
             m = rx.search(t)
             if m:
-                done.add(label)
-                ctx = t[max(0, m.start() - 15):m.start()].replace('\n', ' ').replace('\r', ' ')
-                problems.append('%s（在「…%s」的後面）' % (label, ctx) if ctx.strip() else label)
+                hit(label, t, m.start())
                 break
+    for label, vals in (rules.get('values') or {}).items():
+        if label not in done and vals:
+            found = _value_hits(sq, vals)
+            if found:
+                hit(label, sq, found[0][1])
     wl = rules.get('watchlist') or {}
     if wl:
         codes = [c for c, _ in ck.cands]
         names = [n for _, n in ck.cands]
-        text = _mask_watch_text(un, codes, names)
-        hit = False
-        for code, name in wl.items():
-            if re.search(r'(?<![0-9A-Za-z.])' + re.escape(code) + r'(?![0-9A-Za-z]|\.[0-9])', text):
-                hit = True
-            elif len(name) >= 2 and name not in names and name in text:
-                hit = True
-        if hit:
+        found = False
+        for text in _uniq([_mask_watch_text(un, codes, names),
+                           _mask_watch_text(sq, [_nf(c) for c in codes], [_strip_cf(_nf(n)) for n in names])]):
+            for code, name in wl.items():
+                if re.search(r'(?<![0-9A-Za-z.])' + re.escape(code) + r'(?![0-9A-Za-z]|\.[0-9])', text):
+                    found = True
+                elif len(name) >= 2 and name not in names and _nf(name) not in [_nf(n) for n in names] and name in text:
+                    found = True
+        if found:
             problems.append('頁面裡出現了自選股清單裡、但不是今天候選標的的股票')
     return problems[:30], info
 
