@@ -50,3 +50,9 @@ share_publish=0
 # share_repo：要公開到的 GitHub 儲存庫，寫成 帳號/儲存庫名稱，例如 yourname/tw-stock-screener-results
 # 請準備一個專用的新儲存庫（裡面只會放 index.html 和 README.md 兩個檔案），帳號要和 gh 登入的帳號一樣。
 share_repo=
+
+# share_pwa=1：分享頁多了「每日歷史」和 PWA（可以加到手機主畫面、看過的頁面沒有網路也能開）。預設關閉。
+#   要同時打開 share=1（或 share_publish=1）。打開後，每次選股會在這個設定檔旁邊的 cache\share\history 存一個當天候選標的的檔案，最多留 120 個交易日。
+#   公開時會多上傳網頁安裝要用的檔案和歷史紀錄（不含總資金、部位、自選股），所以第一次公開 PWA 版要你自己確認：
+#   互動執行 run.bat 輸入 Y，或執行 python screener.py share --config 設定.txt --confirm-pwa 帳號/儲存庫。排程執行不會做這件事。
+share_pwa=0

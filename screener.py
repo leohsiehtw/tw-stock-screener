@@ -8,12 +8,12 @@
   python3 screener.py add  --data DIR --bars 今日.csv
   python3 screener.py config --show 設定.txt | --write 設定.txt | --check {capital,risk,mode} | --check-watchlist 自選股.csv
                            （給 setup.bat 用；--write 讀環境變數 IN_CAPITAL、IN_RISK、IN_MODE）
-  python3 screener.py share --config 設定.txt (--publish [--ask] | --confirm-first-publish 帳號/儲存庫 | --takedown [帳號/儲存庫])
+  python3 screener.py share --config 設定.txt (--publish [--ask] | --confirm-first-publish 帳號/儲存庫 | --confirm-pwa 帳號/儲存庫 | --takedown [帳號/儲存庫])
                            （選用：把分享版公開到 GitHub Pages，或下架；細節見 README「分享給別人看」）
 
 選項優先順序：命令列 > 設定.txt（--config）> 預設值。--out-dir 或設定檔的 output_dir 會一次產生
 盤後選股_<日期>.html/.csv/.md/.txt/.json。--share（或設定檔 share=1）另外產生 分享版_<日期>.html
-（只含候選標的，通過安全檢查才會寫出）。
+（只含候選標的，通過安全檢查才會寫出）。設定檔 share_pwa=1 時，分享版多了 PWA 與每日歷史（cache/share/history）。
 
 結束代碼：0 成功；6 找不到股價資料；7 自選股清單有問題；8 檔案或視窗的文字編碼不對；
 9 設定檔有問題；1 程式發生未預期的錯誤。
@@ -229,7 +229,7 @@ def read_text(path, what, quiet=False):
 
 
 # ---------- 設定檔 ----------
-CONFIG_KEYS = ('capital', 'risk', 'mode', 'watchlist', 'output_dir', 'share', 'share_publish', 'share_repo')
+CONFIG_KEYS = ('capital', 'risk', 'mode', 'watchlist', 'output_dir', 'share', 'share_publish', 'share_repo', 'share_pwa')
 
 
 def _unquote(v):
@@ -337,7 +337,7 @@ def load_config(path):
         got[k] = (n, line, v)
     cfg = dict(capital=None, risk=0.02, mode='full', path=os.path.abspath(path),
                watchlist=_cfg_path('自選股.csv', base), output_dir=_cfg_path('結果', base),
-               share=False, share_publish=False, share_repo=None)
+               share=False, share_publish=False, share_repo=None, share_pwa=False)
     for k, (n, line, v) in got.items():
         if v == '':
             continue
@@ -348,7 +348,7 @@ def load_config(path):
                 cfg[k] = parse_risk(v)
             elif k == 'mode':
                 cfg[k] = parse_mode(v)
-            elif k in ('share', 'share_publish'):
+            elif k in ('share', 'share_publish', 'share_pwa'):
                 cfg[k] = parse_onoff(v)
             elif k == 'share_repo':
                 cfg[k] = parse_repo(v)
@@ -368,6 +368,8 @@ def describe_config(cfg):
         out.append('分享版：每次選股會另外產生 分享版_日期.html（只含候選標的）')
     if cfg.get('share_publish'):
         out.append('公開分享版：開（%s）；第一次公開要你自己確認' % (cfg.get('share_repo') or '還沒有填 share_repo'))
+    if cfg.get('share_pwa'):
+        out.append('分享版加上 PWA 與每日歷史（可加到手機主畫面、離線看過的頁面；公開時多出的檔案要你自己確認）')
     return out
 
 
@@ -583,6 +585,115 @@ def analyze(code, name, bars):
     return r
 
 
+# ---------- 線圖（候選標的與觀察名單的 K 線圖資料） ----------
+# 每一列的資料是 data-ch 屬性裡一串純英文字母（頁面上沒有數字，所以不會被分享版的安全檢查當成金額）；
+# 圖由頁面程式在使用者打開時才畫。chart_series 只讀 bars，算法和 analyze 一致（價格一律乘 adj）。
+CHART_DAYS = 120
+CHART_MAX = 8000
+CHART_RE = re.compile(r'[A-Za-z]{8,8000}')
+SHARE_CHART_BUDGET = 290_000        # 分享版（含線圖）的位元組上限；share.MAX_BYTES 留 10 KB 的餘裕
+
+
+def chart_series(bars, days=CHART_DAYS):
+    """最後 min(n, days) 根的 K 線與指標。價格類乘 adj（和 analyze 的 px 同一個算法，不四捨五入）；
+    量、MACD 用原值；wk = (週 DIF, 週 OSC, 週 OSC 剛翻紅)。"""
+    n = len(bars)
+    C = [b['close'] for b in bars]
+    V = [b['volume'] for b in bars]
+    adj = bars[n - 1]['raw_close'] / C[n - 1]
+    ma20, ma60 = sma(C, 20), sma(C, 60)
+    dif, dea, osc = macd(C)
+    _, up, lo, _ = boll(C)
+    mv5 = sma(V, 5)
+    wd, _, wo = macd(weekly(bars))
+    s = n - min(n, days)
+
+    def px(xs):
+        return [None if x is None else x * adj for x in xs[s:]]
+    return dict(date=[b['date'] for b in bars[s:]], o=px([b['open'] for b in bars]), h=px([b['high'] for b in bars]),
+                l=px([b['low'] for b in bars]), c=px(C), ma20=px(ma20), ma60=px(ma60), up=px(up), lo=px(lo),
+                v=V[s:], mv5=mv5[s:], dif=dif[s:], dea=dea[s:], osc=osc[s:],
+                wk=(wd[-1], wo[-1], wo[-1] > 0 and min(wo[-3:-1]) <= 0))
+
+
+def _vi(v):
+    """非負整數 → 26 進位字母，高位在前；最後一位小寫、其他大寫（解碼時看大小寫就知道一個數在哪裡結束）"""
+    d = [v % 26]
+    v //= 26
+    while v:
+        d.append(v % 26)
+        v //= 26
+    d.reverse()
+    return ''.join(chr(65 + x) for x in d[:-1]) + chr(97 + d[-1])
+
+
+def _zz(v):
+    return _vi(2 * v if v >= 0 else -2 * v - 1)
+
+
+def chart_code(s):
+    """chart_series 的結果 → 一串英文字母（欄位順序見下面；解碼寫在 HTML_JS 的 chDec）。
+    價格取 4 位有效數，MACD 取 3 位有效數，量分成 0～675 級；遇到不合理的資料丟 ValueError。"""
+    n = len(s['c'])
+    if not 2 <= n <= 400:
+        raise ValueError('線圖：根數不合理')
+    for k in ('o', 'h', 'l', 'c'):
+        if len(s[k]) != n or any(not _isnum(x) or x <= 0 for x in s[k]):
+            raise ValueError('線圖：價格不是正數')
+    for k in ('ma20', 'ma60', 'up', 'lo', 'v', 'mv5', 'dif', 'dea', 'osc'):
+        if len(s[k]) != n or any(x is not None and not _isnum(x) for x in s[k]):
+            raise ValueError('線圖：數值不是有限的數字')
+    if any(x < 0 for x in s['v']) or not all(_isnum(x) for x in s['wk'][:2]) or len(s['date']) != n:
+        raise ValueError('線圖：數值不合理')
+    e = max(-2, math.floor(math.log10(max(s['h']))) - 3)
+    q = (lambda x: round(x * 10 ** -e)) if e < 0 else (lambda x: round(x / 10 ** e))
+
+    def grp(xs, f):
+        """前導缺值的個數；之後第一個值，再接逐筆差（zigzag）"""
+        k = 0
+        while k < n and xs[k] is None:
+            k += 1
+        if any(x is None for x in xs[k:]):
+            raise ValueError('線圖：資料中間有缺值')
+        out = [_vi(k)]
+        if k < n:
+            a = [f(x) for x in xs[k:]]
+            out.append(_vi(a[0]))
+            out.extend(_zz(y - x) for x, y in zip(a, a[1:]))
+        return ''.join(out)
+
+    def run(a):
+        return _zz(a[0]) + ''.join(_zz(y - x) for x, y in zip(a, a[1:]))
+    o, h, l, c = ([q(x) for x in s[k]] for k in ('o', 'h', 'l', 'c'))
+    d = s['date']
+    ticks = [(i, int(d[i][5:7])) for i in range(1, n) if d[i][5:7] != d[i - 1][5:7]]
+    out = [_vi(1), _vi(n), _vi(e + 2), _vi(int(d[-1][5:7])), _vi(int(d[-1][8:10])), _vi(len(ticks))]
+    out += [_vi(i) + _vi(m) for i, m in ticks]
+    out += [_vi(c[0]), ''.join(_zz(y - x) for x, y in zip(c, c[1:]))]
+    out.append(''.join(_zz(a - b) for a, b in zip(o, c)))
+    out.append(''.join(_vi(max(0, a - max(b, x))) for a, b, x in zip(h, o, c)))
+    out.append(''.join(_vi(max(0, min(b, x) - a)) for a, b, x in zip(l, o, c)))
+    out.append(grp(s['ma20'], q))
+    out.append(grp(s['ma60'], q))
+    out.append(grp([None if u is None else u - m for u, m in zip(s['up'], s['ma20'])], q))
+    vmax = max(s['v']) or 1
+    lv = lambda x: round(x / vmax * 675)
+    out.append(''.join(_vi(lv(x)) for x in s['v']))
+    out.append(grp(s['mv5'], lv))
+    m = max(abs(x) for k in ('dif', 'dea', 'osc') for x in s[k])
+    me = -10 if m == 0 else max(-10, min(5, math.floor(math.log10(m)) - 2))
+    qm = (lambda x: round(x * 10 ** -me)) if me < 0 else (lambda x: round(x / 10 ** me))
+    out.append(_vi(me + 10))
+    out.append(run([qm(x) for x in s['dif']]))
+    out.append(run([qm(x) or (x > 0) - (x < 0) for x in s['osc']]))       # 非 0 卻量化成 0：留下正負號
+    wd, wo, flip = s['wk']
+    out.append(_vi((wd > 0) + 2 * (wo > 0) + 4 * bool(flip)) + _zz(round(wd * 100)) + _zz(round(wo * 100)))
+    code = ''.join(out)
+    if len(code) > CHART_MAX:
+        raise ValueError('線圖：資料太長')
+    return code
+
+
 def size(r, capital, risk):
     if not capital or 'stop' not in r or r['stop'] >= r['close']:
         return
@@ -658,17 +769,18 @@ def push_text(res, list_mode):
 
 
 # ---------- HTML / CSV 輸出（給不用命令列的人看） ----------
-# 結果頁的顏色。測試會用 WCAG 公式檢查：文字對背景 ≥ 4.5:1、圖形記號 ≥ 3:1。
+# 結果頁的顏色。測試會用 WCAG 公式檢查：主要與次要文字（ink、ink2）≥ 7:1、其他文字 ≥ 4.5:1；
+# ink3 是有意義的框線與圖形（篩選鈕、輸入框、類型標籤的框、價位條軌道）≥ 4.5:1；hairline 只是分隔線。
 # 漲跌依台灣習慣：紅漲（up）、綠跌（down），並一律加上 ▲▼ 與正負號，不只靠顏色。
 PALETTE = dict(
-    light=dict(page='#ffffff', surface='#f5f5f7', nav='#fafafc', ink='#1d1d1f', ink2='#6e6e73', ink3='#86868b',
+    light=dict(page='#ffffff', surface='#f5f5f7', nav='#fafafc', ink='#1d1d1f', ink2='#4f4f53', ink3='#6e6e73',
                link='#0066cc', accent='#0071e3', btn='#0071e3', btn_hover='#0076df', btn_active='#006edb',
-               on_btn='#ffffff', hairline='rgba(0,0,0,.16)', band='#d2d2d7',
-               up='#c8102e', down='#1d7f3a', warn='#b25000', cap='#7d3cb5'),
-    dark=dict(page='#000000', surface='#1d1d1f', nav='#161617', ink='#f5f5f7', ink2='#86868b', ink3='#86868b',
+               on_btn='#ffffff', hairline='rgba(0,0,0,.22)', band='#bdbdc2',
+               up='#a50e26', down='#0b5e28', warn='#873c00', cap='#6b2fa3'),
+    dark=dict(page='#000000', surface='#1d1d1f', nav='#161617', ink='#f5f5f7', ink2='#aeaeb2', ink3='#8e8e93',
               link='#2997ff', accent='#2997ff', btn='#0071e3', btn_hover='#0076df', btn_active='#006edb',
-              on_btn='#ffffff', hairline='rgba(255,255,255,.24)', band='#48484a',
-              up='#ff7a70', down='#30d158', warn='#ffa94d', cap='#d09cff'),
+              on_btn='#ffffff', hairline='rgba(255,255,255,.3)', band='#545458',
+              up='#ff8a80', down='#30d158', warn='#ffa94d', cap='#d09cff'),
 )
 
 
@@ -700,12 +812,13 @@ p{margin:0}
 .brand{font-size:14px;line-height:18px;font-weight:600}
 .navdate{font-size:12px;line-height:16px;color:var(--ink2)}
 .navr{display:flex;align-items:center;gap:16px;min-width:0}
-.theme{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--hairline);border-radius:980px}
-.tm{position:relative;font:inherit;font-size:12px;line-height:16px;letter-spacing:normal;color:var(--ink2);background:none;border:0;border-radius:980px;padding:4px 10px;min-width:44px;cursor:pointer}
+.theme{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--ink3);border-radius:980px}
+.tm{position:relative;touch-action:manipulation;font:inherit;font-size:12px;line-height:16px;letter-spacing:normal;color:var(--ink2);background:none;border:0;border-radius:980px;padding:4px 10px;min-width:44px;cursor:pointer}
 .tm::after{content:"";position:absolute;left:0;right:0;top:-10px;bottom:-10px}
 .tm:hover{color:var(--ink)}
 .tm[aria-pressed="true"]{background:var(--ink);color:var(--page)}
 .sec{display:inline-block;margin-left:8px;font-size:12px;line-height:16px;font-weight:400;color:var(--ink2);white-space:nowrap}
+.kd{display:inline-block;margin-left:8px;font-size:12px;line-height:14px;font-weight:400;color:var(--ink2);border:1px solid var(--ink3);border-radius:5px;padding:0 5px;white-space:nowrap}
 .band{padding-block:48px 56px;--card:var(--surface);scroll-margin-top:44px}
 .band.alt{background:var(--surface);--card:var(--page)}
 .stack{display:flex;flex-direction:column;gap:24px}
@@ -729,9 +842,9 @@ tbody th{font-weight:400}
 .n{text-align:right}
 td.n{white-space:nowrap}
 .ct th.nm{min-width:180px}
-.sb{font:inherit;color:inherit;background:none;border:0;padding:4px 0;cursor:pointer;letter-spacing:inherit;text-align:inherit}
+.sb{touch-action:manipulation;font:inherit;color:inherit;background:none;border:0;padding:4px 0;cursor:pointer;letter-spacing:inherit;text-align:inherit}
 .sb:hover{color:var(--ink)}
-.si::after{content:" \\2195";opacity:.7}
+.si::after{content:" \\2195"}
 th[aria-sort=ascending] .si::after{content:" \\25B2";opacity:1}
 th[aria-sort=descending] .si::after{content:" \\25BC";opacity:1}
 th[aria-sort] .sb{color:var(--ink)}
@@ -761,7 +874,7 @@ th[aria-sort] .sb{color:var(--ink)}
 .desc{font-size:14px;line-height:18px;color:var(--ink2)}
 .pb{position:relative;height:20px;margin:2px 6px 0}
 .pb span{position:absolute}
-.pb-track{left:0;right:0;top:9px;height:2px;background:var(--hairline)}
+.pb-track{left:0;right:0;top:9px;height:2px;background:var(--ink3)}
 .pb-band{top:6px;height:8px;background:var(--band);border-radius:5px}
 .pb-risk{top:8px;height:4px;background:var(--warn)}
 .pb-stop,.pb-ma{top:2px;width:2px;height:16px;margin-left:-1px}
@@ -774,26 +887,74 @@ th[aria-sort] .sb{color:var(--ink)}
 .k-ma::before{width:2px;height:12px;background:var(--ink2)}
 .k-close::before{width:8px;height:8px;border-radius:50%;background:var(--ink)}
 .k-band::before{width:14px;height:8px;border-radius:4px;background:var(--band)}
+.chb{touch-action:manipulation;font:inherit;font-size:14px;line-height:18px;letter-spacing:normal;color:var(--ink);background:none;padding:7px 14px;border:1px solid var(--ink3);border-radius:980px;cursor:pointer;white-space:nowrap}
+.chb::after{content:" \\25BE"}
+.chb[aria-expanded="true"]::after{content:" \\25B4"}
+.chb:hover{border-color:var(--ink)}
+.chb[aria-expanded="true"]{background:var(--ink);color:var(--page);border-color:var(--ink)}
+.nm .chb{display:block;margin-top:8px}
+.chp{margin-top:12px}
+.chp svg{display:block;width:100%;height:auto}
+.chk{display:flex;flex-wrap:wrap;gap:4px 16px;margin:8px 0 0;padding:0;list-style:none;font-size:12px;line-height:16px;color:var(--ink2)}
+.chk li::before{content:"";display:inline-block;width:16px;margin-right:4px;vertical-align:middle;border-top:2px var(--ks,solid) var(--kc,var(--ink2))}
+.chk .lg-bar::before{--kc:var(--up);border-top-width:8px}
+.chk .lg-m20::before,.chk .lg-dif::before{--kc:var(--link)}
+.chk .lg-m60::before{--kc:var(--cap);--ks:dashed}
+.chk .lg-dea::before{--kc:var(--cap);--ks:dashed}
+.chk .lg-bb::before{--ks:dotted}
+.chk .lg-stop::before{--kc:var(--warn);--ks:dashed}
+.chk .lg-dot::before{--kc:var(--ink);width:8px;height:8px;border:0;border-radius:50%;background:var(--ink)}
+.chk .lg-mv::before{--kc:var(--ink)}
+.chk .lg-osc::before{--kc:var(--down);border-top-width:8px}
+.chw{margin-top:8px;font-size:12px;line-height:16px;color:var(--ink2)}
+.chp .chb{margin-top:8px}
+.ct .r3 td{padding-top:0}
+.cx-up{fill:var(--up)}
+.cx-dn{fill:var(--down)}
+.cx-fl{fill:var(--ink2)}
+.cx-wu,.cx-wd,.cx-wf,.cx-ma20,.cx-ma60,.cx-bb,.cx-stop,.cx-mv5,.cx-dif,.cx-dea,.cx-grid{fill:none}
+.cx-wu{stroke:var(--up)}
+.cx-wd{stroke:var(--down)}
+.cx-wf{stroke:var(--ink2)}
+.cx-ma20{stroke:var(--link);stroke-width:1.5}
+.cx-ma60{stroke:var(--cap);stroke-width:1.5;stroke-dasharray:6 3}
+.cx-bb{stroke:var(--ink2);stroke-width:1;stroke-dasharray:2 3}
+.cx-stop{stroke:var(--warn);stroke-width:1.5;stroke-dasharray:6 3}
+.cx-mv5{stroke:var(--ink);stroke-width:1.25}
+.cx-dif{stroke:var(--link);stroke-width:1.5}
+.cx-dea{stroke:var(--cap);stroke-width:1.5;stroke-dasharray:4 3}
+.cx-grid{stroke:var(--hairline);stroke-width:1}
+.cx-cl{fill:var(--ink);stroke:var(--card);stroke-width:2}
+.cx-t,.cx-tb,.cx-ts{font-size:11px}
+.cx-t{fill:var(--ink2)}
+.cx-tb{fill:var(--ink);font-weight:600}
+.cx-ts{fill:var(--warn)}
 .vh{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .tools{display:flex;flex-wrap:wrap;gap:16px 24px;align-items:flex-end}
 .seg{border:0;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px;min-width:0}
 .seg legend{font-size:12px;line-height:16px;color:var(--ink2);padding:0;margin-bottom:6px;width:100%}
 .seg label{position:relative}
 .seg input{position:absolute;opacity:0;width:1px;height:1px}
-.seg span{display:inline-block;font-size:14px;line-height:18px;padding:7px 14px;border:1px solid var(--ink2);border-radius:980px;cursor:pointer;white-space:nowrap}
+.seg span{display:inline-block;font-size:14px;line-height:18px;padding:7px 14px;border:1px solid var(--ink3);border-radius:980px;cursor:pointer;white-space:nowrap;touch-action:manipulation}
+.seg input:not(:checked)+span:hover{border-color:var(--ink)}
 .seg input:checked+span{background:var(--ink);color:var(--page);border-color:var(--ink)}
 .seg input:focus-visible+span{outline:2px solid var(--accent);outline-offset:3px}
+.subs{flex:1 1 100%}
+.sublg{font-size:12px;line-height:16px;color:var(--ink2);margin-bottom:-2px;width:100%}
+.chip{touch-action:manipulation;font:inherit;font-size:14px;line-height:18px;letter-spacing:normal;color:var(--ink);background:none;padding:7px 14px;border:1px solid var(--ink3);border-radius:980px;cursor:pointer;white-space:nowrap}
+.chip:hover{border-color:var(--ink)}
+.chip[aria-pressed="true"]{background:var(--ink);color:var(--page);border-color:var(--ink)}
 .fld{display:flex;flex-direction:column;gap:6px;font-size:12px;line-height:16px;color:var(--ink2)}
-.fld input,.fld select{font:inherit;font-size:14px;line-height:18px;color:var(--ink);background:var(--page);border:1px solid var(--ink2);border-radius:8px;padding:7px 12px;min-width:0;letter-spacing:normal}
+.fld input,.fld select{font:inherit;font-size:14px;line-height:18px;color:var(--ink);background:var(--page);border:1px solid var(--ink3);border-radius:8px;padding:7px 12px;min-width:0;letter-spacing:normal}
 .fld input{width:200px;max-width:100%}
 .status{font-size:14px;line-height:18px;color:var(--ink2)}
-.btn{font:inherit;font-size:14px;line-height:18px;border-radius:980px;padding:8px 18px;cursor:pointer;letter-spacing:inherit}
+.btn{touch-action:manipulation;font:inherit;font-size:14px;line-height:18px;border-radius:980px;padding:8px 18px;cursor:pointer;letter-spacing:inherit}
 .btn-p{background:var(--btn);color:var(--on-btn);border:1px solid var(--btn)}
 .btn-p:hover{background:var(--btn-hover)}
 .btn-p:active{background:var(--btn-active)}
 .y{text-align:center}
 .x{text-align:center;color:var(--ink2)}
-details>summary{cursor:pointer;width:max-content;max-width:100%;list-style:none;font-size:17px;line-height:25px;color:var(--link);border:1px solid var(--link);border-radius:980px;padding:8px 20px}
+details>summary{cursor:pointer;touch-action:manipulation;width:max-content;max-width:100%;list-style:none;font-size:17px;line-height:25px;color:var(--link);border:1px solid var(--link);border-radius:980px;padding:8px 20px}
 details>summary::-webkit-details-marker{display:none}
 details>summary:hover{background:var(--btn);border-color:var(--btn);color:var(--on-btn)}
 details[open]>summary{margin-bottom:24px}
@@ -831,6 +992,8 @@ h2{font-size:24px;line-height:28px}
 .nw{white-space:nowrap}
 .cards td[data-label]::before{content:attr(data-label);display:block;font-size:12px;line-height:16px;color:var(--ink2)}
 .ct .r2 td{padding-top:16px!important}
+.wt tbody tr.chon{margin-bottom:0;border-radius:16px 16px 0 0}
+.wt tbody tr.chr{display:block;border-radius:0 0 16px 16px;padding-top:0}
 .r2 .inner{grid-template-columns:minmax(0,1fr)}
 .st{font-size:14px;line-height:18px}
 .st th,.st td{padding:8px 3px}
@@ -884,6 +1047,8 @@ HTML_JS = r'''
   try { t0 = localStorage.getItem(TK) || 'auto'; } catch (e) { }
   setTheme(t0, false);
   all('.tm').forEach(function (b) { b.addEventListener('click', function () { setTheme(b.getAttribute('data-set'), true); }); });
+  var COLL = null;
+  try { COLL = new Intl.Collator('zh-Hant'); } catch (e) { }
   function cmp(x, y, num) {
     if (num) {
       x = parseFloat(x); y = parseFloat(y);
@@ -891,7 +1056,7 @@ HTML_JS = r'''
       if (isNaN(y)) { y = -Infinity; }
       return x < y ? -1 : (x > y ? 1 : 0);
     }
-    return String(x).localeCompare(String(y), 'zh-Hant');
+    return COLL ? COLL.compare(String(x), String(y)) : String(x).localeCompare(String(y), 'zh-Hant');
   }
   function mark(table, key, dir) {
     all('thead th', table).forEach(function (th) {
@@ -926,11 +1091,279 @@ HTML_JS = r'''
     return sort;
   }
 
+  // 線圖：每列的 data-ch 是一串英文字母（欄位順序見 screener.py 的 chart_code），第一次打開才解碼、才畫
+  var chN = 0, chAll = [], chTimer = 0;
+  function chDec(s) {
+    if (!/^[A-Za-z]+$/.test(s || '')) { return null; }
+    var p = 0, bad = false, o = {}, n, t, j, ver, b;
+    function u() {
+      var v = 0, c;
+      for (;;) {
+        if (p >= s.length) { bad = true; return 0; }
+        c = s.charCodeAt(p++);
+        if (c < 91) { v = v * 26 + c - 65; } else { return v * 26 + c - 97; }
+        if (v > Math.pow(2, 30)) { bad = true; return 0; }
+      }
+    }
+    function z() { var v = u(); return v % 2 ? -(v + 1) / 2 : v / 2; }
+    function grp(m) {
+      var a = [], k = u(), x, i;
+      if (k > m) { bad = true; return a; }
+      for (i = 0; i < k; i++) { a.push(null); }
+      if (k < m) {
+        x = u();
+        a.push(x);
+        for (i = k + 1; i < m; i++) { x += z(); a.push(x); }
+      }
+      return a;
+    }
+    function run(m) {
+      var a = [], x = z(), i;
+      a.push(x);
+      for (i = 1; i < m; i++) { x += z(); a.push(x); }
+      return a;
+    }
+    ver = u(); n = u(); o.n = n; o.e = u() - 2;
+    if (bad || ver !== 1 || n < 2 || n > 400) { return null; }
+    o.mo = u(); o.dy = u();
+    t = u();
+    if (t > 40) { return null; }
+    o.tk = [];
+    for (j = 0; j < t; j++) { o.tk.push([u(), u()]); }
+    o.c = []; o.op = []; o.h = []; o.l = []; o.up = []; o.lo = []; o.v = []; o.dea = [];
+    o.c.push(u());
+    for (j = 1; j < n; j++) { o.c.push(o.c[j - 1] + z()); }
+    for (j = 0; j < n; j++) { o.op.push(o.c[j] + z()); }
+    for (j = 0; j < n; j++) { o.h.push(Math.max(o.op[j], o.c[j]) + u()); }
+    for (j = 0; j < n; j++) { o.l.push(Math.min(o.op[j], o.c[j]) - u()); }
+    o.m20 = grp(n); o.m60 = grp(n);
+    b = grp(n);
+    for (j = 0; j < n; j++) {
+      if (o.m20[j] === null || b[j] === null) { o.up.push(null); o.lo.push(null); } else { o.up.push(o.m20[j] + b[j]); o.lo.push(o.m20[j] - b[j]); }
+    }
+    for (j = 0; j < n; j++) { o.v.push(u()); }
+    o.mv = grp(n);
+    u();
+    o.dif = run(n); o.osc = run(n);
+    for (j = 0; j < n; j++) { o.dea.push(o.dif[j] - o.osc[j]); }
+    b = u();
+    o.wk = [b % 2 === 1, Math.floor(b / 2) % 2 === 1, Math.floor(b / 4) % 2 === 1, z() / 100, z() / 100];
+    if (bad || p !== s.length) { return null; }
+    return o;
+  }
+  function chSvg(o, w, stop, close, id) {
+    var n = o.n, st = Math.pow(10, o.e), dec = Math.max(0, -o.e), i, k;
+    var small = w < 520, hp = small ? 160 : 220, hv = small ? 44 : 56, hm = small ? 56 : 72, ty = 8;
+    var x0 = 4, x1 = w - 56, slot = (x1 - x0) / n, bw = Math.max(1, slot * 0.66);
+    var yv = ty + hp + 10, ym = yv + hv + 10, ht = ym + hm + 20;
+    var lo = Infinity, hi = -Infinity;
+    function r1(x) { return Math.round(x * 10) / 10; }
+    function px(j) { return x0 + (j + 0.5) * slot; }
+    function ext(a) {
+      for (var j = 0; j < a.length; j++) {
+        if (a[j] !== null) { if (a[j] < lo) { lo = a[j]; } if (a[j] > hi) { hi = a[j]; } }
+      }
+    }
+    var sv = stop === null ? null : stop / st, cv = close === null ? o.c[n - 1] : close / st;
+    ext(o.l); ext(o.h); ext(o.m20); ext(o.m60); ext(o.up); ext(o.lo); ext([cv]);
+    if (sv !== null) { ext([sv]); }
+    var pad = (hi - lo) * 0.05 || 1;
+    lo -= pad; hi += pad;
+    function py(x) { return ty + (hi - x) / (hi - lo) * hp; }
+    function line(a, f) {
+      var s = '', on = false, j;
+      for (j = 0; j < a.length; j++) {
+        if (a[j] !== null) { s += (on ? 'L' : 'M') + r1(px(j)) + ' ' + r1(f(a[j])); on = true; }
+      }
+      return s;
+    }
+    function pth(cls, dd) { return dd ? '<path class="' + cls + '" d="' + dd + '"/>' : ''; }
+    function txt(cls, x, y, an, s) {
+      return '<text class="' + cls + '" x="' + r1(x) + '" y="' + r1(y) + '" text-anchor="' + an + '">' + s + '</text>';
+    }
+    var wk = { u: '', d: '', f: '' }, bd = { u: '', d: '', f: '' }, vb = { u: '', d: '', f: '' };
+    var vm = 1, vy0 = yv + hv, ob = { u: '', d: '' };
+    for (i = 0; i < n; i++) { if (o.v[i] > vm) { vm = o.v[i]; } if (o.mv[i] !== null && o.mv[i] > vm) { vm = o.mv[i]; } }
+    var mm = 1;
+    for (i = 0; i < n; i++) { mm = Math.max(mm, Math.abs(o.dif[i]), Math.abs(o.dea[i]), Math.abs(o.osc[i])); }
+    var yz = ym + hm / 2;
+    function vy(x) { return vy0 - x / vm * hv; }
+    function my(x) { return yz - x / mm * (hm / 2 - 2); }
+    for (i = 0; i < n; i++) {
+      k = o.c[i] > o.op[i] ? 'u' : (o.c[i] < o.op[i] ? 'd' : 'f');
+      var x = px(i), ya = py(Math.max(o.op[i], o.c[i])), yb = py(Math.min(o.op[i], o.c[i]));
+      wk[k] += 'M' + r1(x) + ' ' + r1(py(o.h[i])) + 'V' + r1(py(o.l[i]));
+      bd[k] += 'M' + r1(x - bw / 2) + ' ' + r1(ya) + 'h' + r1(bw) + 'v' + r1(Math.max(1, yb - ya)) + 'h' + r1(-bw) + 'z';
+      vb[k] += 'M' + r1(x - bw / 2) + ' ' + r1(vy(o.v[i])) + 'h' + r1(bw) + 'V' + r1(vy0) + 'h' + r1(-bw) + 'z';
+      if (o.osc[i] !== 0) {
+        var y1 = my(o.osc[i]), y2 = Math.min(y1, yz), hh = Math.max(1, Math.abs(y1 - yz));
+        ob[o.osc[i] > 0 ? 'u' : 'd'] += 'M' + r1(x - bw / 2) + ' ' + r1(y2) + 'h' + r1(bw) + 'v' + r1(hh) + 'h' + r1(-bw) + 'z';
+      }
+    }
+    var yc = py(cv), ys = sv === null ? -99 : py(sv), cl = yc, sl = ys;
+    if (sv !== null && Math.abs(yc - ys) < 13) { if (ys >= yc) { sl = yc + 13; } else { cl = ys + 13; } }
+    var grid = '', labs = '', f, gy;
+    for (i = 0; i < 3; i++) {
+      f = [0.1, 0.5, 0.9][i];
+      gy = py(lo + (hi - lo) * f);
+      grid += 'M' + x0 + ' ' + r1(gy) + 'H' + r1(x1);
+      if (Math.abs(gy - cl) > 9 && Math.abs(gy - sl) > 9) { labs += txt('cx-t', x1 + 4, gy + 4, 'start', ((lo + (hi - lo) * f) * st).toFixed(dec)); }
+    }
+    var out = '<svg viewBox="0 0 ' + w + ' ' + Math.round(ht) + '" role="img" aria-labelledby="cht-' + id + ' chd-' + id + '">';
+    out += '<title id="cht-' + id + '"></title><desc id="chd-' + id + '"></desc>';
+    out += pth('cx-grid', grid + 'M' + x0 + ' ' + r1(vy0) + 'H' + r1(x1) + 'M' + x0 + ' ' + r1(yz) + 'H' + r1(x1));
+    out += pth('cx-bb', line(o.up, py) + line(o.lo, py));
+    out += '<g class="cg-p">' + pth('cx-wu', wk.u) + pth('cx-wd', wk.d) + pth('cx-wf', wk.f);
+    out += pth('cx-up', bd.u) + pth('cx-dn', bd.d) + pth('cx-fl', bd.f) + '</g>';
+    out += pth('cx-ma60', line(o.m60, py)) + pth('cx-ma20', line(o.m20, py));
+    if (sv !== null) { out += pth('cx-stop', 'M' + x0 + ' ' + r1(ys) + 'H' + r1(x1)); }
+    out += '<circle class="cx-cl" cx="' + r1(px(n - 1)) + '" cy="' + r1(yc) + '" r="3.5"/>';
+    out += labs + txt('cx-tb', x1 + 4, cl + 4, 'start', '收 ' + (close === null ? (o.c[n - 1] * st).toFixed(dec) : close));
+    if (sv !== null) { out += txt('cx-ts', x1 + 4, sl + 4, 'start', '停損 ' + stop); }
+    out += '<g class="cg-v">' + pth('cx-up', vb.u) + pth('cx-dn', vb.d) + pth('cx-fl', vb.f) + '</g>' + pth('cx-mv5', line(o.mv, vy));
+    out += txt('cx-t', x1 + 4, yv + 10, 'start', '量') + txt('cx-t', x1 + 4, ym + 10, 'start', 'MACD');
+    out += '<g class="cg-m">' + pth('cx-up', ob.u) + pth('cx-dn', ob.d) + '</g>' + pth('cx-dea', line(o.dea, my)) + pth('cx-dif', line(o.dif, my));
+    var prev = -99, yd = ym + hm + 14, lc = x1 - 15, t, xx;
+    for (i = 0; i < o.tk.length; i++) {
+      t = o.tk[i]; xx = px(t[0]);
+      if (xx >= 14 && xx - prev >= 28 && lc - xx >= 28) { out += txt('cx-t', xx, yd, 'middle', t[1] + '月'); prev = xx; }
+    }
+    out += txt('cx-t', x1, yd, 'end', (o.mo < 10 ? '0' : '') + o.mo + '/' + (o.dy < 10 ? '0' : '') + o.dy);
+    return out + '</svg>';
+  }
+  function chNum(a) {
+    var v = parseFloat(a);
+    return isFinite(v) && v > 0 ? v : null;
+  }
+  function chLegend(c) {
+    var ul = d.createElement('ul'), it = [['bar', 'K 棒：紅漲綠跌'], ['m20', 'MA20'], ['m60', 'MA60'], ['bb', '布林上下軌']];
+    if (c.stop !== null) { it.push(['stop', '建議停損']); }
+    it.push(['dot', '收盤'], ['mv', '量與 5 日均量'], ['dif', 'DIF'], ['dea', 'DEA'], ['osc', 'MACD 柱：紅正綠負']);
+    ul.className = 'chk';
+    it.forEach(function (x) {
+      var li = d.createElement('li');
+      li.className = 'lg-' + x[0];
+      li.textContent = x[1];
+      ul.appendChild(li);
+    });
+    return ul;
+  }
+  function chBuild(c) {
+    var tr = d.createElement('tr'), td = d.createElement('td'), box = d.createElement('div');
+    tr.className = c.cand ? 'r3' : 'chr';
+    td.setAttribute('colspan', c.r1.children.length);
+    box.className = 'chp';
+    box.id = 'chp-' + c.id;
+    c.view = d.createElement('div');
+    c.rest = d.createElement('div');
+    box.appendChild(c.view); box.appendChild(c.rest);
+    td.appendChild(box); tr.appendChild(td);
+    tr.hidden = true;
+    if (c.cand) {
+      c.host.insertBefore(tr, c.host.querySelector('.r2').nextSibling);
+    } else {
+      c.r1.parentNode.insertBefore(tr, c.r1.nextSibling);
+      tr._r = c.r1;
+    }
+    box._c = c;
+    c.pan = tr; c.box = box;
+  }
+  function chDraw(c) {
+    var w = Math.max(300, Math.min(980, Math.round(c.box.clientWidth))), o = c.o, ti, de, parts, last, wl, cb;
+    function fm(v) { return (v * Math.pow(10, o.e)).toFixed(Math.max(0, -o.e)); }
+    if (c.drawn && Math.abs(w - c.w) <= 40) { return; }
+    if (!c.drawn) { o = c.o = chDec(c.s); }
+    c.w = w;
+    if (!o) {
+      c.view.textContent = '這檔的線圖資料有問題，無法顯示';
+      c.drawn = true;
+      return;
+    }
+    c.view.innerHTML = chSvg(o, w, c.stop, c.close, c.id);
+    ti = c.view.querySelector('title'); de = c.view.querySelector('desc');
+    ti.textContent = c.code + ' ' + c.name + ' 近 ' + o.n + ' 日 K 線圖';
+    last = o.n - 1;
+    parts = ['最後收盤 ' + (c.close === null ? fm(o.c[last]) : c.close)];
+    if (c.stop !== null) { parts.push('建議停損 ' + c.stop); }
+    if (o.m20[last] !== null) { parts.push('MA20 約 ' + fm(o.m20[last])); }
+    if (o.m60[last] !== null) { parts.push('MA60 約 ' + fm(o.m60[last])); }
+    parts.push('MACD 柱狀體' + (o.osc[last] > 0 ? '為正（紅）' : (o.osc[last] < 0 ? '為負（綠）' : '為零')));
+    de.textContent = parts.join('，');
+    if (!c.drawn) {
+      c.rest.appendChild(chLegend(c));
+      wl = d.createElement('p');
+      wl.className = 'chw';
+      wl.textContent = '週 MACD：DIF ' + o.wk[3].toFixed(2) + (o.wk[0] ? '（零軸上）' : '（零軸下）') + '、柱 ' + o.wk[4].toFixed(2) + (o.wk[1] ? (o.wk[2] ? '（紅，剛翻紅）' : '（紅）') : '（綠）');
+      c.rest.appendChild(wl);
+      cb = d.createElement('button');
+      cb.type = 'button';
+      cb.className = 'chb';
+      cb.setAttribute('aria-expanded', 'true');
+      cb.setAttribute('aria-controls', 'chp-' + c.id);
+      cb.textContent = '收起';
+      cb.addEventListener('click', function () { chToggle(c, false); c.btn.focus(); });
+      c.rest.appendChild(cb);
+    }
+    c.drawn = true;
+  }
+  function chToggle(c, force) {
+    var op = c.pan ? c.pan.hidden : true;
+    if (typeof force === 'boolean') { op = force; }
+    if (op && !c.pan) { chBuild(c); }
+    if (!c.pan) { return; }
+    c.pan.hidden = !op;
+    c.btn.setAttribute('aria-expanded', op ? 'true' : 'false');
+    if (!c.cand) { c.r1.className = c.r1.className.replace(/\s*chon\b/, '') + (op ? ' chon' : ''); }
+    if (op) { chDraw(c); }
+  }
+  function chInit(h) {
+    var cand = h.tagName === 'TBODY', r1 = cand ? h.querySelector('.r1') : h, th = r1 ? r1.querySelector('th.nm') : null;
+    var s = h.getAttribute('data-ch'), c, b;
+    if (!s || !th) { return; }
+    chN++;
+    b = d.createElement('button');
+    b.type = 'button';
+    b.className = 'chb';
+    b.setAttribute('aria-expanded', 'false');
+    b.setAttribute('aria-controls', 'chp-' + chN);
+    b.setAttribute('aria-label', 'K 線圖：' + (h.getAttribute('data-code') || '') + ' ' + (h.getAttribute('data-name') || ''));
+    b.textContent = 'K 線圖';
+    th.appendChild(b);
+    c = { id: chN, btn: b, host: h, r1: r1, cand: cand, s: s, code: h.getAttribute('data-code') || '', name: h.getAttribute('data-name') || '',
+      close: chNum(h.getAttribute('data-close')), stop: cand ? chNum(h.getAttribute('data-stop')) : null, pan: null, drawn: false, w: 0 };
+    b._c = c;
+    chAll.push(c);
+    b.addEventListener('click', function () { chToggle(c); });
+    r1.addEventListener('click', function (e) {
+      var t = e.target, sel = window.getSelection ? String(window.getSelection()) : '';
+      if (sel.length) { return; }
+      while (t && t !== r1) {
+        if (/^(BUTTON|A|INPUT|SELECT|LABEL)$/.test(t.tagName)) { return; }
+        t = t.parentNode;
+      }
+      chToggle(c);
+    });
+  }
+  all('[data-ch]').forEach(chInit);
+  d.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' && e.keyCode !== 27) { return; }
+    var t = e.target, c = null;
+    while (t && !c) { c = t._c || null; t = t.parentNode; }
+    if (c && c.pan && !c.pan.hidden) { chToggle(c, false); c.btn.focus(); }
+  });
+  window.addEventListener('resize', function () {
+    clearTimeout(chTimer);
+    chTimer = setTimeout(function () { chAll.forEach(function (c) { if (c.pan && !c.pan.hidden) { chDraw(c); } }); }, 200);
+  });
+
   // 候選標的：排序、篩選、搜尋
   var ct = d.getElementById('ct');
   if (ct) {
     var cands = all('tbody.cand', ct), sel = d.getElementById('csort'), q = d.getElementById('cq');
     var st = d.getElementById('cstatus'), none = d.getElementById('cnone'), csec = d.getElementById('csec');
+    var subBox = d.getElementById('csub'), subs = subBox ? all('.chip', subBox) : [], sub = 'all';
+    var lastK = 'all', isSub = function (v) { return v !== 'all' && subs.some(function (b) { return b.getAttribute('data-sub') === v; }); };
+    var hasOpt = function (v) { return csec && all('option', csec).some(function (o) { return o.value === v; }); };
     var sortC = makeSortable(ct, cands, ct, function (key, dir) {
       var v = key + '|' + dir;
       if (sel) { sel.value = key === 'i' ? 'i|ascending' : v; if (sel.value !== (key === 'i' ? 'i|ascending' : v)) { sel.selectedIndex = -1; } }
@@ -947,10 +1380,21 @@ HTML_JS = r'''
     };
     var filter = function () {
       var t = radio('ft'), k = radio('fk'), g = csec ? csec.value : 'all', s = q ? q.value.replace(/^\s+|\s+$/g, '').toLowerCase() : '';
+      // ETF 子類：只在類別是 ETF 時出現；離開 ETF 就回到「全部」。和類股選單同步（選單選 ETF-債券 ＝ 按「債券」）
+      if (k !== 'etf') {
+        sub = 'all';
+        if (lastK === 'etf' && g.indexOf('ETF') === 0) { g = 'all'; if (csec) { csec.value = 'all'; } }
+      } else if (isSub(g)) { sub = g; }
+      lastK = k;
+      if (subBox) {
+        subBox.hidden = k !== 'etf';
+        subs.forEach(function (b) { b.setAttribute('aria-pressed', b.getAttribute('data-sub') === sub ? 'true' : 'false'); });
+      }
       shown = 0;
       cands.forEach(function (c) {
         var ok = (t === 'all' || c.getAttribute('data-type') === t) && (k === 'all' || c.getAttribute('data-kind') === k)
           && (g === 'all' || (g === 'none' ? !c.getAttribute('data-sec') : (c.getAttribute('data-sec') === g || c.getAttribute('data-sec').split('-')[0] === g)))
+          && (sub === 'all' || c.getAttribute('data-sec') === sub)
           && (!s || (c.getAttribute('data-code') + ' ' + c.getAttribute('data-name')).toLowerCase().indexOf(s) >= 0);
         c.hidden = !ok;
         if (ok) { shown++; }
@@ -960,13 +1404,30 @@ HTML_JS = r'''
     };
     all('input[name="ft"],input[name="fk"]').forEach(function (r) { r.addEventListener('change', filter); });
     if (q) { q.addEventListener('input', filter); }
-    if (csec) { csec.addEventListener('change', filter); }
+    if (csec) {
+      csec.addEventListener('change', function () {
+        var v = csec.value;
+        sub = isSub(v) ? v : 'all';
+        filter();
+      });
+    }
+    subs.forEach(function (b) {
+      b.addEventListener('click', function () {
+        sub = b.getAttribute('data-sub');
+        if (csec) { csec.value = sub !== 'all' && hasOpt(sub) ? sub : 'all'; }
+        filter();
+      });
+    });
     filter();
   }
 
   // 觀察名單
   var wt = d.getElementById('wt');
-  if (wt && wt.tBodies[0]) { makeSortable(wt, all('tr', wt.tBodies[0]), wt.tBodies[0]); }
+  if (wt && wt.tBodies[0]) {
+    makeSortable(wt, all('tr', wt.tBodies[0]), wt.tBodies[0], function () {
+      all('tr.chr', wt).forEach(function (p) { p.parentNode.insertBefore(p, p._r.nextSibling); });
+    });
+  }
 
   // 各關明細：展開時才產生表格，每次 200 檔
   var det = d.getElementById('stages-det');
@@ -980,7 +1441,7 @@ HTML_JS = r'''
     var pack = JSON.parse(d.getElementById('stage-data').textContent), data = pack.r, SEC = pack.s;
     var tb = d.getElementById('st-body'), more = d.getElementById('st-more'), info = d.getElementById('st-info');
     var dq = d.getElementById('dq'), table = d.getElementById('st'), view = data, n = 0, CH = 200;
-    data.forEach(function (r, i) { r.push(i); });
+    data.forEach(function (r, i) { r.push(i, (r[0] + ' ' + r[1]).toLowerCase()); });
     function row(r) {
       var s = '<tr><th scope="row">' + esc(r[0]) + '</th><td>' + esc(r[1]) + '</td><td class="lo">' + esc(SEC[r[7]] || '—') + '</td><td class="n">' + esc(r[2]) + '</td>';
       for (var k = 0; k < 6; k++) { s += (r[3] >> k) & 1 ? '<td class="y">✓</td>' : '<td class="x">✗</td>'; }
@@ -1006,11 +1467,12 @@ HTML_JS = r'''
     var sk = -1, sd = '';
     function apply() {
       var s = dq.value.replace(/^\s+|\s+$/g, '').toLowerCase();
-      view = s ? data.filter(function (r) { return (r[0] + ' ' + r[1]).toLowerCase().indexOf(s) >= 0; }) : data.slice();
+      view = s ? data.filter(function (r) { return r[9].indexOf(s) >= 0; }) : data.slice();
       if (sk >= 0) {
-        var num = sk > 2;
+        var num = sk > 2, ks = {};
+        view.forEach(function (r) { ks[r[8]] = key(r, sk); });
         view.sort(function (a, b) {
-          var r = cmp(key(a, sk), key(b, sk), num);
+          var r = cmp(ks[a[8]], ks[b[8]], num);
           if (sd === 'descending') { r = -r; }
           return r || (a[8] - b[8]);
         });
@@ -1056,15 +1518,35 @@ INDUSTRY = (
     ('存託憑證', (('91', '存託憑證'),)),
 )
 INDUSTRY_SHORT = {'電腦及週邊設備業': '電腦週邊', '觀光事業': '觀光餐旅'}
-# ETF 類型，由上往下第一個符合的為準：(標籤, 代號最後一碼, 名稱關鍵字)；名稱先做 NFKC 再轉大寫
+# ETF 類型，由上往下第一個符合的為準：(標籤, 代號最後一碼, 名稱關鍵字)；名稱先做 NFKC，英文不分大小寫。
+# 順序：槓桿反向 > 主動式（A 主動股票、D 主動債券、T 平衡）> 債券 > 商品期貨 > 高股息 > 永續 > 主題 > 金融 > 科技
+# > 海外 > 策略（動能、等權、優選、Smart 等因子選股）> 市值型：主題勝過地區（國泰北美科技 → 科技、國泰日本不動產 → 主題），地區勝過市值型（元大S&P500 → 海外），
+# 所以市值型只剩台股大盤與市值指數。純英數的關鍵字前後不能緊接大寫英文字母（AI 不會配到 TAIWAN，NASDAQxT 仍配到 NASDAQ）
 ETF_TYPES = (
     ('ETF-槓桿反向', 'LR', ('正2', '反1', '槓桿', '反向')),
+    ('ETF-主動式', 'ADT', ('主動', '平衡')),
     ('ETF-債券', 'B', ('債',)),
     ('ETF-商品期貨', 'U', ('黃金', '原油', '石油', '期貨')),
-    ('ETF-高股息', '', ('高股息', '高息', '股息')),
-    ('ETF-市值型', '', ('台灣50', '臺灣50', '台50', '中型100', '台灣加權', '臺灣加權', 'MSCI台灣', '摩台', 'S&P500', '標普500',
-                       '美國500', '美國50', 'NASDAQ', '那斯達克', '市值')),
+    ('ETF-高股息', '', ('高股息', '高息', '股息', '股利', '優息', '填息', '收益')),
+    ('ETF-永續', '', ('ESG', '永續', '綠能', '綠色', '淨零', '低碳', '潔淨', '公司治理')),
+    ('ETF-主題', '', ('生技', '基因', '醫療', '太空', '衛星', '航太', '防衛', '航運', '不動產', '地產', 'REITS',
+                     '軟體', '稀土', '支付')),
+    ('ETF-金融', '', ('金融',)),
+    ('ETF-科技', '', ('科技', '半導體', 'IC設計', '晶圓', 'PCB', 'AI', '5G', '通訊', '網路', '資安', '機器人', '電動車',
+                     '元宇宙', '智能車', '未來車', '電池', '儲能', '數據', '電力', '算力', 'FANG', 'MAG7', '費城')),
+    ('ETF-海外', '', ('美國', '美股', '北美', 'S&P', '標普', 'NASDAQ', '納斯達克', '那斯達克', '道瓊', '日本', '日經', '東證',
+                     '東証', '中國', '滬深', '上證', '上証', '深100', '深証', '深證', '中証', '中證', 'A股', '恒生', '香港', '印度',
+                     '越南', '歐洲', '韓國', 'KOSPI', '亞洲', '新興', '全球', '世界')),
+    ('ETF-策略', '', ('動能', 'Smart', '智慧', '等權', '優選', '高價', '中小')),
+    ('ETF-市值型', '', ('台灣50', '臺灣50', '台50', '中型100', '台灣加權', '臺灣加權', 'MSCI台灣', '摩台', '市值', '富櫃50',
+                       '領袖50', '旗艦50', 'TOP50', '藍籌')),
 )
+# 關鍵字表達不了的個別代號（2026-10-30 依名稱與追蹤主題判斷）：科技股為主的高息 ETF 算科技；
+# 綠能及電動車（成分以電動車、電池供應鏈為主）算科技；美國電力基建（公用事業、工程營建）算主題
+ETF_OVERRIDE = {
+    '00927': 'ETF-科技', '00929': 'ETF-科技', '00943': 'ETF-科技', '00946': 'ETF-科技', '00962': 'ETF-科技',
+    '00896': 'ETF-科技', '009805': 'ETF-主題',
+}
 ETF_OTHER = 'ETF-其他'      # 不叫「ETF」：篩選選單的「ETF（全部）」值就是 ETF
 SECTOR_STALE_DAYS = 14      # 類股資料比資料日期舊超過這麼多天，頁面上提醒
 
@@ -1092,15 +1574,19 @@ def _build_sectors():
 
 SECTOR_BY_CODE, SECTOR_BY_NAME, _ORDER = _build_sectors()
 ETF_LABELS = tuple(t[0] for t in ETF_TYPES) + (ETF_OTHER,)
+_ETF_RX = tuple(re.compile('|'.join(r'(?<![A-Z])(?i:%s)(?![A-Z])' % re.escape(w) if w.isascii() else re.escape(w) for w in words))
+                for _, _, words in ETF_TYPES)
 SECTOR_ORDER = tuple(_ORDER) + ETF_LABELS
 SECTOR_LABELS = frozenset(SECTOR_ORDER)
 
 
 def etf_type(code, name):
-    n = unicodedata.normalize('NFKC', name or '').upper()
+    if code in ETF_OVERRIDE:
+        return ETF_OVERRIDE[code]
+    n = unicodedata.normalize('NFKC', name or '')
     last = (code or '')[-1:]
-    for label, letters, words in ETF_TYPES:
-        if (last.isalpha() and last in letters) or any(w.upper() in n for w in words):
+    for (label, letters, _), rx in zip(ETF_TYPES, _ETF_RX):
+        if (last.isalpha() and last in letters) or rx.search(n):
             return label
     return ETF_OTHER
 
@@ -1124,6 +1610,46 @@ def attach_sectors(res, rows):
 def industry_dir(data):
     """類股快取在 --data 的上一層的 cache/industry（fetch_data.py 寫的）"""
     return os.path.join(os.path.dirname(os.path.abspath(data)), 'cache', 'industry')
+
+
+MARKETS = (('twse', '上市'), ('tpex', '上櫃'))
+
+
+def load_market(data):
+    """代號 -> 上市／上櫃：讀 --data 上一層 cache 裡最新一天的每日快照（含 ETF），再用類股快取補；只讀不寫，絕不丟例外"""
+    base, out = os.path.join(os.path.dirname(os.path.abspath(data)), 'cache'), {}
+    for mkt, label in MARKETS:
+        try:
+            days = sorted((f for f in os.listdir(os.path.join(base, mkt)) if re.fullmatch(r'[0-9]{8}\.json', f)), reverse=True)
+        except OSError:
+            days = []
+        for f in days:
+            try:
+                with open(os.path.join(base, mkt, f), encoding='utf-8') as fh:
+                    rows = json.load(fh).get('rows')
+            except Exception:
+                continue
+            if isinstance(rows, list) and rows:
+                for row in rows:
+                    if isinstance(row, list) and row and isinstance(row[0], str):
+                        out.setdefault(row[0], label)
+                break
+    for mkt, label in MARKETS:
+        try:
+            with open(os.path.join(base, 'industry', mkt + '.json'), encoding='utf-8') as fh:
+                rows = json.load(fh).get('rows')
+            for k in rows if isinstance(rows, dict) else ():
+                if isinstance(k, str):
+                    out.setdefault(k, label)
+        except Exception:
+            pass
+    return out
+
+
+def attach_markets(res, markets):
+    """每筆最後（sector 之後）加上 market：上市、上櫃，查不到是空字串"""
+    for r in res:
+        r['market'] = (markets or {}).get(r.get('code'), '')
 
 
 def load_industry(d):
@@ -1266,6 +1792,22 @@ def _sec_stale(sinfo):
     return '<p class="cap14">類股資料未更新%s，分類可能不是最新的。</p>' % when
 
 
+def _etf_subs(cands):
+    """類別選 ETF 時才出現的子類按鈕列（全部 N、債券 3…，依檔數多到少）；候選裡沒有 ETF 回傳空字串"""
+    cnt = {}
+    for r in cands:
+        if IS_ETF.match(r['code']) and r.get('sector') in ETF_LABELS:
+            cnt[r['sector']] = cnt.get(r['sector'], 0) + 1
+    if not cnt:
+        return ''
+    order = sorted(cnt, key=lambda l: (-cnt[l], ETF_LABELS.index(l)))
+    btn = '<button type="button" class="chip" data-sub="%s" aria-pressed="%s">%s</button>'
+    out = [btn % ('all', 'true', html.escape('全部 %d' % sum(cnt.values())))]
+    out += [btn % (_a(l), 'false', html.escape('%s %d' % (l[4:], cnt[l]))) for l in order]
+    return ('<div class="seg subs" id="csub" role="group" aria-label="ETF 子類" hidden>'
+            '<p class="sublg" aria-hidden="true">ETF 子類</p>%s</div>' % ''.join(out))
+
+
 def _sector_ui(cands, sinfo):
     """候選標的的類股統計列與選單：沒有類股資料、或一檔都沒分到類時回傳 ('', '')"""
     if (sinfo or {}).get('status', 'none') == 'none' or not any(r.get('sector') for r in cands):
@@ -1319,7 +1861,8 @@ def _sec_summary(B, ctx):
 
 
 def _sec_tag(r):
-    return '<span class="sec">%s</span>' % html.escape(r['sector']) if r.get('sector') else ''
+    kd = ('ETF' if IS_ETF.match(r.get('code') or '') else '個股') + ('·' + r['market'] if r.get('market') else '')
+    return ('<span class="sec">%s</span>' % html.escape(r['sector']) if r.get('sector') else '') + '<span class="kd">%s</span>' % html.escape(kd)
 
 
 def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台積'):
@@ -1341,6 +1884,7 @@ def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台
     B.append('<div class="tools needs-js">'
              + _seg('ft', '型態', [('all', '全部 %d' % len(cands)), ('突破型', '突破型 %d' % nb), ('回測型', '回測型 %d' % (len(cands) - nb))])
              + _seg('fk', '類別', [('all', '全部 %d' % len(cands)), ('stock', '個股 %d' % (len(cands) - ne)), ('etf', 'ETF %d' % ne)])
+             + _etf_subs(cands)
              + sec_sel
              + '<label class="fld" for="cq">搜尋代號或名稱<input type="search" id="cq" autocomplete="off" placeholder="%s"></label>' % _a(placeholder)
              + '<label class="fld" for="csort">排序<select id="csort">'
@@ -1367,6 +1911,9 @@ def _sec_cands(B, ctx, capital, risk_txt, risk, placeholder='例如 2330 或 台
                      name=r['name'], close=r['close'], chg=r['chg'], vr=r['vol_ratio'], stop=r['stop'], dist=dist)
         attrs.update(('p%d' % j, p[0]) for (p, _), (j, _) in zip(pos, pcols))
         attrs['sec'] = r.get('sector') or ''
+        attrs['mkt'] = r.get('market') or ''
+        if (ctx.get('charts') or {}).get(r['code']):
+            attrs['ch'] = ctx['charts'][r['code']]
         cells = ['<th scope="row" class="nm"><span class="tag %s">%s</span><br><span class="code">%s</span>'
                  '<span class="name">%s</span>%s</th>' % (tcls, h(r['type']), h(r['code']), h(r['name']), _sec_tag(r)),
                  '<td class="n" data-label="收盤">%s</td>' % h(str(r['close'])),
@@ -1404,6 +1951,8 @@ def _sec_watch(B, ctx, list_mode):
         s = r['stages']
         attrs = dict(i=i, code=r['code'], name=r['name'], close=r['close'], chg=r['chg'], vr=r['vol_ratio'],
                      w0=int(bool(s[0])), w1=int(bool(s[1])), osc=r['osc'][1])
+        if (ctx['charts'] or {}).get(r['code']):
+            attrs['ch'] = ctx['charts'][r['code']]
         chk = lambda b, lab: '<td class="%s" data-label="%s">%s</td>' % ('y' if b else 'x', lab, '✓ 通過' if b else '✗ 未過')
         rows.append('<tr %s><th scope="row" class="nm"><span class="code">%s</span><span class="name">%s</span>%s</th>'
                     '<td class="n" data-label="收盤">%s</td><td class="n" data-label="漲跌%%">%s</td>'
@@ -1470,9 +2019,10 @@ def _sec_help(B, ctx):
 <li>漲跌%：依台灣習慣，<span class="up">▲ 紅色是上漲</span>、<span class="down">▼ 綠色是下跌</span>，也都會寫正負號。</li>
 <li>停損距離：<span class="d-ok">近</span> 3% 以內，風險空間小；<span class="d-mid">中</span> 3%～6%，普通；<span class="d-wide">遠</span> 超過 6%，停損很遠，單筆虧損會偏大。</li>
 <li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
+<li>K 線圖：候選標的和觀察名單的每一列都有「K 線圖」按鈕（點那一列也可以），展開近 120 個交易日的日 K 線，附 MA20、MA60、布林上下軌、成交量與 MACD；候選標的另外畫出建議停損線。圖上的價格是約略值，精確數字看表格。按 Esc 或「收起」關閉。</li>
 <li>部位：依「單筆虧損 = 總資金 × 比例」反推股數，1 張 = 1000 股。<span class="p-cap">紫色</span>表示已經買到總資金上限，<span class="p-odd">橘色</span>表示不到 1 張（零股）。沒設定總資金就不會有這一欄。</li>
 <li>觀察名單是第二優先：動能和量能到了、型態還沒到。各關明細檔數多，預設收起來，按「展開」才列出，可以搜尋和排序。</li>
-<li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成高股息、市值型、債券等；候選標的可以用「類股」選單篩選。查不到的標示為未分類（各關明細寫「—」）。</li>
+<li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成主動式、高股息、科技、海外、市值型、債券等；旁邊的小框寫個股或 ETF 與上市／上櫃；候選標的可以用「類股」選單篩選。查不到的標示為未分類（各關明細寫「—」）。</li>
 <li>頁面右上角可切換自動（跟著電腦或手機）／淺色／深色，選擇記在這個瀏覽器；無痕或封鎖網站資料時只在這次有效。手機上表格會改成一張一張的卡片。</li>
 </ul>
 <p>進場後：停損跌破月線或突破長紅 K 低點；單筆虧損控制在總資金 2%～5%；停利用移動停損，跟著月線或 5 日線上移。</p>
@@ -1507,7 +2057,7 @@ def render_html(res, list_mode, meta):
     ctx = dict(res=res, ok=ok, date=date, title=title, meta=meta, scope=scope,
                cands=sorted([r for r in ok if r.get('type')], key=lambda r: (r['type'], -r['vol_ratio'])),
                watch=[r for r in ok if r['watch'] and not r.get('type')],
-               sinfo=meta.get('sector_info') or {'status': 'none', 'fetched': ''},
+               sinfo=meta.get('sector_info') or {'status': 'none', 'fetched': ''}, charts=meta.get('charts') or {},
                wname='自選股觀察' if list_mode else '觀察名單',
                wtitle='自選股：過第 2、3 關但型態未到' if list_mode else '觀察名單',
                pos=('總資金 %s 元、每筆風險 %s%%' % (format(int(capital), ','), risk_txt)) if capital else '未設定總資金，不試算部位')
@@ -1524,14 +2074,332 @@ def render_html(res, list_mode, meta):
 
 # ---------- 分享版（只含候選標的；可選擇公開到 GitHub Pages） ----------
 # 只複製這幾個欄位：新增欄位不會自動出現在分享版裡（寧可少放，不要多放）
-SHARE_FIELDS = ('code', 'name', 'type', 'close', 'chg', 'vol_ratio', 'stop', 'setup', 'stop_why', 'sector')
-SHARE_OPTIONAL = ('sector',)        # 舊資料沒有這些欄位時當作空字串
+SHARE_FIELDS = ('code', 'name', 'type', 'close', 'chg', 'vol_ratio', 'stop', 'setup', 'stop_why', 'sector', 'market')
+SHARE_OPTIONAL = ('sector', 'market')        # 舊資料沒有這些欄位時當作空字串
 SHARE_MA = ('ma20', 'boll_up', 'boll_lo')
 SHARE_CODE_RE = re.compile(r'[0-9]{4}[0-9A-Z]{0,2}')
 SHARE_HEAD = HTML_HEAD.replace('<title>', '<meta name="robots" content="noindex, nofollow">\n<title>', 1)
 _cut = HTML_JS.index('\n  // 觀察名單\n')
 # 只留「候選標的」的那一段（排序、篩選、搜尋）；整行註解拿掉
 SHARE_JS = '\n'.join(x for x in HTML_JS[:_cut].split('\n') if not x.lstrip().startswith('//')) + '\n})();\n'
+
+
+# ---------- 分享版的 PWA 與每日歷史（設定檔 share_pwa=1 才會用到；只附加，不改 SHARE_JS／HTML_CSS） ----------
+PWA_CSS = '''.hbar{display:flex;flex-direction:column;gap:12px}
+.hrow{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
+.hrow .chip{min-width:44px;min-height:44px}
+.hrow .chip:disabled{opacity:.4;cursor:default}
+.bdg{display:inline-block;margin-left:8px;font-size:12px;line-height:16px;font-weight:400;border:1px solid currentColor;border-radius:5px;padding:0 5px;white-space:nowrap}
+.bd-new{color:var(--link)}
+.bd-old{color:var(--ink2)}
+.hgone{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+.htrend svg{display:block;width:100%;height:auto}
+.hb{cursor:pointer}
+.hb-p{fill:var(--ink3)}
+.hb-b{fill:var(--up)}
+.hb-t{fill:transparent}
+.hb-s{fill:none;stroke:var(--ink);stroke-width:3}
+.hb-ax{stroke:var(--hairline);stroke-width:1}
+.hl{font-size:22px;fill:var(--ink2)}
+.a2hs{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;font-size:14px;line-height:18px;border:1px solid var(--ink3);border-radius:12px;padding:12px 16px}
+.bnav{display:none}
+.topnav{padding-top:env(safe-area-inset-top,0px)}
+@media (max-width:734px){
+.bnav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:6;background:var(--nav);border-top:1px solid var(--hairline);padding-bottom:env(safe-area-inset-bottom,0px)}
+.bnav a{flex:1 1 0;min-height:44px;display:flex;align-items:center;justify-content:center;font-size:14px;line-height:18px;color:var(--ink);touch-action:manipulation}
+.bnav a:hover{text-decoration:none}
+.bnav a:active{background:var(--surface)}
+.hrow{flex-wrap:nowrap}
+.hrow .fld{flex:1 1 0;min-width:0}
+.hrow .fld select{width:100%}
+body{padding-bottom:calc(52px + env(safe-area-inset-bottom,0px))}
+}
+@media (display-mode:standalone){.a2hs{display:none}}
+'''
+
+# 全部包在 try 裡，出錯也不影響 SHARE_JS；只用 ES5；不用註解、不寫網址、不用 data／mode 當名稱（會碰到洩漏檢查的規則）
+PWA_JS = r'''
+(function () {
+  try {
+    var d = document, loc = location, web = /^https?:$/.test(loc.protocol);
+    function el(i) { return d.getElementById(i); }
+    function mk(tag, cls, txt) {
+      var e = d.createElement(tag);
+      if (cls) { e.className = cls; }
+      if (txt !== undefined) { e.textContent = txt; }
+      return e;
+    }
+    function ymd(s) { return s.replace(/-/g, ''); }
+    if ('serviceWorker' in navigator && web) {
+      window.addEventListener('load', function () {
+        try { navigator.serviceWorker.register('sw.js').then(null, function () { }); } catch (e) { }
+      });
+    }
+    var ah = el('a2hs');
+    if (ah && web && window.matchMedia) {
+      var narrow = matchMedia('(max-width: 734px)').matches;
+      var standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+      var seen = false;
+      try { seen = localStorage.getItem('twss-a2hs') === '1'; } catch (e) { }
+      if (narrow && !standalone && !seen) {
+        ah.appendChild(mk('span', '', '把這一頁加到主畫面，之後像 App 一樣開啟（瀏覽器選單裡的「加入主畫面」；iPhone 請用 Safari 的分享選單）。'));
+        var ins = mk('button', 'chip', '安裝'), x = mk('button', 'chip', '知道了'), ev0 = null;
+        ins.type = 'button'; x.type = 'button'; ins.hidden = true;
+        window.addEventListener('beforeinstallprompt', function (ev) { ev.preventDefault(); ev0 = ev; ins.hidden = false; });
+        ins.addEventListener('click', function () { if (ev0) { ev0.prompt(); } });
+        x.addEventListener('click', function () {
+          ah.hidden = true;
+          try { localStorage.setItem('twss-a2hs', '1'); } catch (e) { }
+        });
+        ah.appendChild(ins); ah.appendChild(x);
+        ah.hidden = false;
+      }
+    }
+    var bar = el('hbar');
+    if (!bar || !window.fetch || !web) { return; }
+    var TODAY = bar.getAttribute('data-day') || '', TC = ymd(TODAY);
+    var h2 = el('cands-h'), view = el('hview'), trend = el('htrend'), nav = el('bnav');
+    var h2txt = h2 ? h2.textContent : '', days = [], cache = {}, shown = '', cur = '', hid = [], sum0 = '';
+    var stat = mk('p', 'status'), sel = mk('select'), prev = mk('button', 'chip', '◀'), next = mk('button', 'chip', '▶');
+    var gone = mk('div', 'hgone');
+    var DOW = ['日', '一', '二', '三', '四', '五', '六'];
+    function dow(s) { var p = s.split('-'); return '星期' + DOW[new Date(+p[0], +p[1] - 1, +p[2]).getDay()]; }
+    function okDay(j) {
+      if (!j || j.v !== 1 || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(j.date) || !(j.rows instanceof Array)) { return false; }
+      for (var i = 0; i < j.rows.length; i++) {
+        if (!(j.rows[i] instanceof Array) || j.rows[i].length !== 10) { return false; }
+      }
+      return true;
+    }
+    function load(c) {
+      if (cache[c]) { return Promise.resolve(cache[c]); }
+      return fetch('history/' + c + '.json').then(function (r) {
+        if (!r.ok) { throw 0; }
+        return r.json();
+      }).then(function (j) {
+        if (!okDay(j) || ymd(j.date) !== c) { throw 0; }
+        cache[c] = j;
+        return j;
+      });
+    }
+    function idxOf(c) {
+      for (var i = 0; i < days.length; i++) { if (ymd(days[i].d) === c) { return i; } }
+      return 0;
+    }
+    function todayRow() {
+      var t = d.querySelectorAll('#ct tbody.cand'), b = 0, i;
+      for (i = 0; i < t.length; i++) { if (t[i].getAttribute('data-type') === '突破型') { b++; } }
+      return { d: TODAY, n: t.length, b: b };
+    }
+    function td(lab, cls, kid) {
+      var c = mk('td', 'n' + (cls ? ' ' + cls : ''));
+      c.setAttribute('data-label', lab);
+      if (typeof kid === 'string') { c.textContent = kid; } else { c.appendChild(kid); }
+      return c;
+    }
+    function rowEl(r) {
+      var tb = mk('tbody', 'cand'), tr = mk('tr', 'r1'), th = mk('th', 'nm');
+      var close = parseFloat(r[3]), chg = parseFloat(r[4]), stop = parseFloat(r[6]);
+      var dist = (close - stop) / close * 100, g = dist <= 3 ? ['d-ok', '近'] : (dist <= 6 ? ['d-mid', '中'] : ['d-wide', '遠']);
+      th.setAttribute('scope', 'row');
+      th.appendChild(mk('span', 'tag ' + (r[2] === '突破型' ? 't-break' : 't-pull'), r[2]));
+      th.appendChild(mk('br'));
+      th.appendChild(mk('span', 'code', r[0]));
+      th.appendChild(mk('span', 'name', r[1]));
+      if (r[7]) { th.appendChild(mk('span', 'sec', r[7])); }
+      th.appendChild(mk('span', 'kd', (/^00/.test(r[0]) ? 'ETF' : '個股') + (r[8] ? '·' + r[8] : '')));
+      if (+r[9] > 1) { th.appendChild(mk('span', 'bdg bd-old', '連續 ' + r[9] + ' 天')); }
+      tr.appendChild(th);
+      tr.appendChild(td('收盤', '', r[3]));
+      tr.appendChild(td('漲跌%', '', mk('span', chg > 0 ? 'up' : (chg < 0 ? 'down' : 'flat'),
+        chg > 0 ? '▲ +' + chg.toFixed(2) + '%' : (chg < 0 ? '▼ ' + chg.toFixed(2) + '%' : '平 0.00%'))));
+      tr.appendChild(td('量比', '', parseFloat(r[5]).toFixed(2)));
+      tr.appendChild(td('建議停損', '', r[6]));
+      var c = td('停損距離', g[0], dist.toFixed(1) + '%');
+      c.appendChild(mk('span', 'g', g[1]));
+      tr.appendChild(c);
+      tb.appendChild(tr);
+      return tb;
+    }
+    function drawTable(j) {
+      var wrap = mk('div', 'card tw cards'), tb = mk('table', 'ct'), cap = mk('caption', 'vh', '過去的候選標的'), hd = mk('tr'), i;
+      var cols = ['標的', '收盤', '漲跌%', '量比', '建議停損', '停損距離'];
+      for (i = 0; i < cols.length; i++) { hd.appendChild(mk('th', i ? 'n' : 'nm', cols[i])); }
+      var th = mk('thead');
+      th.appendChild(hd);
+      tb.appendChild(cap); tb.appendChild(th);
+      for (i = 0; i < j.rows.length; i++) { tb.appendChild(rowEl(j.rows[i])); }
+      wrap.appendChild(tb);
+      while (view.firstChild) { view.removeChild(view.firstChild); }
+      view.appendChild(wrap);
+    }
+    function showToday() {
+      var i;
+      view.hidden = true;
+      while (view.firstChild) { view.removeChild(view.firstChild); }
+      for (i = 0; i < hid.length; i++) { hid[i].n.hidden = hid[i].h; }
+      hid = [];
+      if (h2) { h2.textContent = h2txt; }
+      gone.hidden = false;
+      shown = '';
+      stat.textContent = sum0;
+      draw();
+    }
+    function showPast(j) {
+      if (!hid.length) {
+        var n = view.nextSibling;
+        while (n) {
+          if (n.nodeType === 1) { hid.push({ n: n, h: n.hidden }); n.hidden = true; }
+          n = n.nextSibling;
+        }
+      }
+      if (h2) { h2.textContent = '候選標的（' + j.date + ' ' + dow(j.date) + '，' + j.rows.length + ' 檔）'; }
+      drawTable(j);
+      view.hidden = false;
+      gone.hidden = true;
+      shown = ymd(j.date);
+      stat.textContent = j.date + ' ' + dow(j.date) + '：掃描 ' + j.scanned + ' 檔，候選標的 ' + j.n + ' 檔（突破型 ' + j.nb + '、回測型 ' + j.np + '）。這是當天的紀錄。';
+      draw();
+    }
+    function pick(c) {
+      cur = c;
+      sel.value = c;
+      var i = idxOf(c || TC);
+      prev.disabled = i >= days.length - 1;
+      next.disabled = i <= 0;
+      if (!c) { showToday(); return; }
+      stat.textContent = '讀取中…';
+      load(c).then(function (j) { if (cur === c) { showPast(j); } }, function () {
+        if (cur === c) {
+          cur = shown;
+          sel.value = shown;
+          stat.textContent = '這一天的紀錄讀不到（可能沒有網路）。';
+        }
+      });
+    }
+    function step(k) {
+      var i = idxOf(cur || TC) + k;
+      if (i >= 0 && i < days.length) { pick(i ? ymd(days[i].d) : ''); }
+    }
+    function draw() {
+      var n = days.length, W = 720, H = 150, base = 120, step0 = W / Math.max(n, 24), bw = Math.max(1, step0 * 0.7), mx = 1, i, s = '';
+      for (i = 0; i < n; i++) { if (days[i].n > mx) { mx = days[i].n; } }
+      var k = (base - 6) / mx, now = shown || TC, tot = 0;
+      for (i = 0; i < n; i++) {
+        var e = days[n - 1 - i], x = W - (n - i) * step0, h1 = (e.n - e.b) * k, h2b = e.b * k, c = ymd(e.d);
+        tot += e.n;
+        s += '<rect class="hb hb-p" data-d="' + c + '" x="' + (x + (step0 - bw) / 2).toFixed(1) + '" y="' + (base - h1).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h1.toFixed(1) + '"></rect>';
+        s += '<rect class="hb hb-b" data-d="' + c + '" x="' + (x + (step0 - bw) / 2).toFixed(1) + '" y="' + (base - h1 - h2b).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h2b.toFixed(1) + '"></rect>';
+        s += '<rect class="hb hb-t" data-d="' + c + '" x="' + x.toFixed(1) + '" y="0" width="' + step0.toFixed(1) + '" height="' + base + '"></rect>';
+        if (c === now) {
+          s += '<rect class="hb-s" x="' + (x + (step0 - bw) / 2 - 1).toFixed(1) + '" y="' + (base - h1 - h2b - 1).toFixed(1) + '" width="' + (bw + 2).toFixed(1) + '" height="' + (h1 + h2b + 2).toFixed(1) + '"></rect>';
+        }
+      }
+      s += '<line class="hb-ax" x1="0" y1="' + base + '" x2="' + W + '" y2="' + base + '"></line>';
+      s += '<text class="hl" x="0" y="146">' + days[n - 1].d.slice(5) + '</text><text class="hl" x="' + W + '" y="146" text-anchor="end">' + days[0].d.slice(5) + '</text>';
+      s += '<text class="hl" x="' + (W / 2) + '" y="146" text-anchor="middle">最多 ' + mx + ' 檔</text>';
+      trend.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="每日候選標的檔數，最近 ' + n + ' 天，最多 ' + mx + ' 檔，今天 ' + days[0].n + ' 檔">' + s + '</svg>';
+      trend.hidden = false;
+    }
+    function badges() {
+      var p1 = days.length > 1 ? ymd(days[1].d) : '';
+      var none = function () { return null; };
+      Promise.all([load(TC).then(null, none), p1 ? load(p1).then(null, none) : null]).then(function (r) {
+        var t = r[0], p = r[1], tm = {}, pm = {}, i, rows = d.querySelectorAll('#ct tbody.cand'), a = 0, b = 0, off = [];
+        if (!t && !p) { return; }
+        if (t) { for (i = 0; i < t.rows.length; i++) { tm[t.rows[i][0]] = +t.rows[i][9]; } }
+        if (p) { for (i = 0; i < p.rows.length; i++) { pm[p.rows[i][0]] = p.rows[i][1]; } }
+        var now = {};
+        for (i = 0; i < rows.length; i++) {
+          var code = rows[i].getAttribute('data-code'), kk = tm[code] || 0, fresh = p ? !(code in pm) : kk === 1;
+          var th = rows[i].querySelector('th.nm'), chb = th ? th.querySelector('.chb') : null;
+          now[code] = 1;
+          if (fresh) { a++; } else { b++; }
+          if (th && (p || kk)) {
+            var bd = mk('span', 'bdg ' + (fresh ? 'bd-new' : 'bd-old'), fresh ? '新增' : (kk > 1 ? '續留・第 ' + kk + ' 天' : '續留'));
+            if (chb) { th.insertBefore(bd, chb); } else { th.appendChild(bd); }
+          }
+        }
+        if (!p) { return; }
+        for (var code2 in pm) { if (!(code2 in now)) { off.push(code2 + ' ' + pm[code2]); } }
+        sum0 = '和 ' + days[1].d + ' 比較：新增 ' + a + ' 檔、續留 ' + b + ' 檔、消失 ' + off.length + ' 檔。';
+        if (!shown) { stat.textContent = sum0; }
+        if (off.length) {
+          var btn = mk('button', 'chip', '看消失的 ' + off.length + ' 檔'), box = mk('p', 'cap14', off.join('、'));
+          btn.type = 'button'; btn.setAttribute('aria-expanded', 'false'); box.hidden = true;
+          btn.addEventListener('click', function () {
+            box.hidden = !box.hidden;
+            btn.setAttribute('aria-expanded', box.hidden ? 'false' : 'true');
+          });
+          gone.appendChild(btn); gone.appendChild(box);
+        }
+      });
+    }
+    function start(j) {
+      var list = [todayRow()], i, e;
+      if (j && j.v === 1 && j.days instanceof Array) {
+        for (i = 0; i < j.days.length; i++) {
+          e = j.days[i];
+          if (e && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(e.d) && e.d < TODAY && typeof e.n === 'number' && typeof e.b === 'number') { list.push(e); }
+        }
+      }
+      days = list.slice(0, 120);
+      sum0 = TODAY + ' ' + dow(TODAY) + '：候選標的 ' + days[0].n + ' 檔。';
+      var row = mk('div', 'hrow'), lab = mk('label', 'fld', '日期'), i2;
+      prev.type = 'button'; next.type = 'button';
+      prev.setAttribute('aria-label', '前一天'); next.setAttribute('aria-label', '後一天');
+      lab.setAttribute('for', 'hsel'); sel.id = 'hsel';
+      for (i2 = 0; i2 < days.length; i2++) {
+        var o = mk('option', '', (i2 ? '' : '今天 ') + days[i2].d + ' ' + dow(days[i2].d) + '（' + days[i2].n + ' 檔）');
+        o.value = i2 ? ymd(days[i2].d) : '';
+        sel.appendChild(o);
+      }
+      lab.appendChild(sel);
+      row.appendChild(prev); row.appendChild(lab); row.appendChild(next);
+      stat.setAttribute('role', 'status'); stat.setAttribute('aria-live', 'polite');
+      bar.appendChild(row); bar.appendChild(stat); bar.appendChild(gone);
+      sel.addEventListener('change', function () { pick(sel.value); });
+      prev.addEventListener('click', function () { step(1); });
+      next.addEventListener('click', function () { step(-1); });
+      if (trend) {
+        trend.addEventListener('click', function (ev) {
+          var c = ev.target && ev.target.getAttribute ? ev.target.getAttribute('data-d') : null;
+          if (c) { pick(c === TC ? '' : c); }
+        });
+      }
+      if (nav) {
+        var a0 = nav.querySelector('a');
+        if (a0) { a0.addEventListener('click', function () { if (cur) { pick(''); } }); }
+      }
+      bar.hidden = false;
+      pick('');
+      badges();
+    }
+    fetch('history/index.json', { cache: 'no-cache' }).then(function (r) {
+      if (!r.ok) { throw 0; }
+      return r.json();
+    }).then(start, function () {
+      bar.appendChild(stat);
+      stat.textContent = '歷史紀錄暫時讀不到，目前只顯示今天。';
+      bar.hidden = false;
+    });
+  } catch (e) { }
+})();
+'''
+
+
+PWA_HIST = ('<section class="band alt" id="hist" aria-labelledby="hist-h"><div class="wrap stack"><h2 id="hist-h">每日歷史</h2>'
+            '<p class="cap14">每個交易日收盤後新增一天，保留最近 120 個交易日。下面的長條是每天的候選標的檔數（紅色是突破型，灰色是回測型），'
+            '點長條或用上面的日期列就能切換到那一天；需要網路載入，沒有網路時只看得到之前開過的日期。</p>'
+            '<div class="htrend needs-js" id="htrend" hidden></div></div></section>')
+PWA_BNAV = ('<nav class="bnav" id="bnav" aria-label="快速切換"><a href="#cands">今日</a><a href="#hist">歷史</a>'
+            '<a href="#help">說明</a></nav>')
+
+
+def _pwa_head():
+    import share
+    h = SHARE_HEAD.replace('content="width=device-width, initial-scale=1"', 'content="%s"' % share.PWA_VIEWPORT, 1)
+    return h.replace('<title>', share.PWA_HEAD_TAGS + '\n<title>', 1).replace('</style>', PWA_CSS + '</style>', 1)
 
 
 def _isnum(v):
@@ -1566,6 +2434,8 @@ def share_rows(res):
         _share_text(row['stop_why'], '停損依據', 300)
         if not isinstance(row['sector'], str) or (row['sector'] and row['sector'] not in SECTOR_LABELS):
             raise ValueError('分享版：類股的內容不合規則')
+        if row['market'] not in ('', '上市', '上櫃'):
+            raise ValueError('分享版：市場的內容不合規則')
         for k in ('close', 'chg', 'vol_ratio', 'stop'):
             if not _isnum(row[k]):
                 raise ValueError('分享版：「%s」不是有效的數字' % k)
@@ -1584,8 +2454,8 @@ def share_rows(res):
     return sorted(rows, key=lambda r: (r['type'], -r['vol_ratio'], r['code']))     # 代號放最後，輸入順序不同也產生同樣的頁面
 
 
-def _share_help():
-    return """<section class="band alt" id="help" aria-labelledby="help-h"><div class="wrap stack help">
+def _share_help(pwa=False):
+    s = """<section class="band alt" id="help" aria-labelledby="help-h"><div class="wrap stack help">
 <h2 id="help-h">怎麼看這一頁</h2>
 <h3>關卡說明</h3><ul>
 <li>第 0 關 週線：週 MACD 在零軸上（或柱狀體剛翻紅），收盤在週 MA13、MA26 之上，週線不是空頭排列。</li>
@@ -1602,18 +2472,41 @@ def _share_help():
 <li>漲跌%：依台灣習慣，<span class="up">▲ 紅色是上漲</span>、<span class="down">▼ 綠色是下跌</span>，也都會寫正負號。</li>
 <li>停損距離：<span class="d-ok">近</span> 3% 以內，停損很近；<span class="d-mid">中</span> 3%～6%，普通；<span class="d-wide">遠</span> 超過 6%，停損很遠，一旦停損虧損會偏大。</li>
 <li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
-<li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成高股息、市值型、債券等；候選標的可以用「類股」選單篩選。</li>
+<li>K 線圖：每一列都有「K 線圖」按鈕（點那一列也可以），展開近 120 個交易日的日 K 線，附 MA20、MA60、布林上下軌、成交量與 MACD，並畫出建議停損線。圖上的價格是約略值，精確數字看表格；候選太多時只有前面的標的有圖。按 Esc 或「收起」關閉。</li>
+<li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成主動式、高股息、科技、海外、市值型、債券等；旁邊的小框寫個股或 ETF 與上市／上櫃；候選標的可以用「類股」選單篩選。</li>
 <li>頁面右上角可切換自動（跟著電腦或手機）／淺色／深色，選擇記在這個瀏覽器；無痕或封鎖網站資料時只在這次有效。手機上表格會改成一張一張的卡片。</li>
 </ul>
 <p class="cap14">本頁僅供程式與技術分析研究，不是投資建議，也不保證任何績效。資料可能延遲、缺漏或有誤，請以交易所公告為準。投資決定與後果由使用者自行承擔。</p>
 </div></section>"""
+    if not pwa:
+        return s
+    more = ('<li>歷史紀錄：每個交易日收盤後新增一天，保留最近 120 個交易日。日期列的 ◀ ▶ 或選單可以切換到過去的某一天'
+            '（過去的日期只列出當天的候選標的，沒有圖和篩選）。標的名稱旁的「新增」表示前一個交易日沒有上榜，「續留・第 N 天」表示連續上榜的天數。</li>\n'
+            '<li>加到主畫面：手機瀏覽器的選單有「加入主畫面」（iPhone 用 Safari 的分享選單），之後像 App 一樣開啟。看過的頁面沒有網路也能開，'
+            '但資料不一定是最新的，瀏覽器也可能清掉離線資料。</li>\n')
+    return s.replace('</ul>\n<p class="cap14">', more + '</ul>\n<p class="cap14">').replace('class="band alt" id="help"', 'class="band" id="help"', 1)
 
 
-def render_share_html(res, sinfo=None):
+def render_share_html(res, sinfo=None, charts=None, pwa=False):
     """分享版：只有今天的候選標的與關卡說明。不收任何 meta（總資金、路徑、產生時間…），同樣的資料一定產生同樣的位元組。
-    不會修改 res；資料有不合規則的地方丟 ValueError。"""
+    不會修改 res；資料有不合規則的地方丟 ValueError。
+    charts：{代號: data-ch}，依顯示順序從前面開始放，整頁超過 SHARE_CHART_BUDGET 就不再放（只有前段的標的有圖）。"""
     h = html.escape
     cands = share_rows(res)
+    if charts:
+        if not all(isinstance(k, str) and isinstance(v, str) and CHART_RE.fullmatch(v) for k, v in charts.items()):
+            raise ValueError('分享版：線圖的資料不合規則')
+        left = SHARE_CHART_BUDGET - len(render_share_html(res, sinfo, None, pwa).encode('utf-8'))
+        keep = {}
+        for r in cands:
+            v = charts.get(r['code'])
+            if v is None:
+                continue
+            left -= len(v) + len(' data-ch=""')
+            if left < 0:
+                break
+            keep[r['code']] = v
+        charts = keep
     ok = [r for r in res if 'error' not in r]
     dates = [r['date'] for r in ok]
     if not dates or any(not isinstance(d, str) or not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', d) for d in dates):
@@ -1628,7 +2521,7 @@ def render_share_html(res, sinfo=None):
     if (not isinstance(sinfo, dict) or sinfo.get('status') not in ('none', 'ok', 'stale')
             or not isinstance(sinfo.get('fetched'), str) or not re.fullmatch(r'|[0-9]{4}-[0-9]{2}-[0-9]{2}', sinfo['fetched'])):
         raise ValueError('分享版：類股資料狀態不合規則')
-    ctx = dict(cands=cands, sinfo=sinfo)
+    ctx = dict(cands=cands, sinfo=sinfo, charts=charts or {})
     B = [_topnav(date) + '<main>']
     B.append('<header class="band alt" id="top"><div class="wrap stack">')
     B.append('<div class="stack" style="gap:8px"><h1><span class="nw">台股盤後選股</span> <span class="nw">%s</span></h1><p class="sub">%s</p></div>' % (
@@ -1639,16 +2532,134 @@ def render_share_html(res, sinfo=None):
              '<div><dt>回測型</dt><dd>%d<small>檔</small></dd></div></dl>' % (len(cands), nb, len(cands) - nb))
     B.append('<p class="cap14">分享版：只列出今天的候選標的與關卡說明。僅供研究，非投資建議。</p>')
     B.extend(x for x in (_sec_stale(sinfo),) if x)
-    B.append('<nav class="jump" aria-label="本頁段落"><a href="#cands">候選標的</a><a href="#help">怎麼看這一頁</a></nav>')
+    jump = '<nav class="jump" aria-label="本頁段落"><a href="#cands">候選標的</a><a href="#help">怎麼看這一頁</a></nav>'
+    if pwa:
+        B.append('<div class="a2hs" id="a2hs" role="note" hidden></div>')
+        jump = jump.replace('<a href="#help">', '<a href="#hist">歷史紀錄</a><a href="#help">')
+    B.append(jump)
     B.append('</div></header>')
+    n0 = len(B)
     _sec_cands(B, ctx, None, '', 0.02, placeholder='輸入代號或名稱')
-    B.append(_share_help())
-    B.append('</main><footer><div class="wrap"><p class="fine">資料日期 %s｜僅供研究，非投資建議。</p></div></footer>' % h(date))
-    return SHARE_HEAD.replace('@@TITLE@@', h('台股盤後選股 %s%s' % (date, _dow(date)))) + '\n'.join(B) + '\n<script>' + SHARE_JS + '</script>\n</body>\n</html>\n'
+    if pwa:
+        for i in range(n0, len(B)):
+            if B[i].startswith('<h2 id="cands-h">'):
+                B[i] += '<div class="hbar needs-js" id="hbar" data-day="%s" hidden></div><div id="hview" hidden></div>' % h(date)
+                break
+        B.append(PWA_HIST)
+    B.append(_share_help(pwa))
+    B.append('</main>' + (PWA_BNAV if pwa else '') + '<footer><div class="wrap"><p class="fine">資料日期 %s｜僅供研究，非投資建議。</p></div></footer>' % h(date))
+    return (_pwa_head() if pwa else SHARE_HEAD).replace('@@TITLE@@', h('台股盤後選股 %s%s' % (date, _dow(date)))) + '\n'.join(B) + '\n<script>' + SHARE_JS + (PWA_JS if pwa else '') + '</script>\n</body>\n</html>\n'
+
+
+# ---------- 每日歷史（share_pwa=1）：每個交易日存一個日檔，格式與檢查見 share.check_history ----------
+def share_history_dir(cfg):
+    """歷史日檔存在設定檔所在資料夾的 cache\\share\\history（用暫存資料夾的設定檔測試，就只會寫進暫存資料夾）"""
+    return os.path.join(os.path.dirname(os.path.abspath(cfg['path'])), 'cache', 'share', 'history')
+
+
+def _prev_trading_day(data, tag):
+    """交易日曆：資料資料夾旁的 cache\\twse\\YYYYMMDD.json 檔名；回傳比 tag 早的最近一天，沒有就回 None"""
+    d = os.path.join(os.path.dirname(os.path.abspath(data)), 'cache', 'twse')
+    try:
+        days = [n[:8] for n in os.listdir(d) if re.fullmatch(r'[0-9]{8}\.json', n)]
+    except OSError:
+        return None
+    before = [n for n in days if n < tag]
+    return max(before) if before else None
+
+
+def _num4(x):
+    return str(round(float(x), 4))
+
+
+def history_json(rows, date, scanned, valid, prev_ks):
+    """rows 是 share_rows 的結果；數字一律寫成字串（數字陣列會被金額規則誤判）；k = 連續上榜天數（前一個交易日有這檔就加 1）"""
+    out = [[r['code'], r['name'], r['type'], _num4(r['close']), _num4(r['chg']), _num4(r['vol_ratio']), _num4(r['stop']),
+            r['sector'], r['market'], str(prev_ks.get(r['code'], 0) + 1)] for r in rows]
+    nb = sum(1 for r in rows if r['type'] == '突破型')
+    obj = {'v': 1, 'date': date, 'scanned': scanned, 'valid': valid, 'n': len(rows), 'nb': nb, 'np': len(rows) - nb, 'rows': out}
+    return json.dumps(obj, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+
+
+def _load_ks(hist_dir, day):
+    try:
+        with open(os.path.join(hist_dir, day + '.json'), encoding='utf-8') as f:
+            return {r[0]: int(r[9]) for r in json.load(f)['rows']}
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return {}
+
+
+def _snapshot(res, tag, data, hist_dir, rules, share):
+    ok = [r for r in res if 'error' not in r]
+    date = max(r['date'] for r in ok)
+    if date.replace('-', '') != tag:
+        raise ValueError('資料日期和檔名不一樣')
+    prev = _prev_trading_day(data, tag)
+    b = history_json(share_rows(res), date, len(res), len(ok), _load_ks(hist_dir, prev) if prev else {})
+    problems = share.check_history(b, rules, tag)
+    if problems:
+        raise ValueError('；'.join(problems[:3]))
+    return b
+
+
+def _write_if_changed(path, b):
+    try:
+        with open(path, 'rb') as f:
+            if f.read() == b:
+                return False
+    except OSError:
+        pass
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(b)
+    os.replace(tmp, path)
+    return True
+
+
+def _backfill_history(hist_dir, out_dir, data, tag, rules, share):
+    """歷史資料夾還不存在時，一次性從結果資料夾補：只取「分享版_D.html 和 盤後選股_D.json 都在」的日期（最多 HISTORY_DAYS 天）"""
+    have = {}
+    for n in os.listdir(out_dir):
+        m = re.fullmatch(r'盤後選股_([0-9]{8})\.json', n)
+        if m and m.group(1) < tag and os.path.exists(os.path.join(out_dir, '分享版_%s.html' % m.group(1))):
+            have[m.group(1)] = os.path.join(out_dir, n)
+    os.makedirs(hist_dir, exist_ok=True)
+    for d in sorted(have)[-share.HISTORY_DAYS:]:
+        try:
+            with open(have[d], encoding='utf-8') as f:
+                res = json.load(f)
+            _write_if_changed(os.path.join(hist_dir, d + '.json'), _snapshot(res, d, data, hist_dir, rules, share))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+
+
+def _prune_history(hist_dir, keep):
+    names = sorted(n for n in os.listdir(hist_dir) if re.fullmatch(r'[0-9]{8}\.json', n))
+    for n in names[:-keep]:
+        try:
+            os.remove(os.path.join(hist_dir, n))
+        except OSError:
+            pass
+
+
+def update_share_history(hist_dir, res, data, out_dir, rules):
+    """把今天的候選標的存成一個日檔（內容沒變就不寫），只留最新 HISTORY_DAYS 個。失敗只印提醒，分享版不受影響。回傳是否成功。"""
+    try:
+        import share
+        tag = max(r['date'] for r in res if 'error' not in r).replace('-', '')
+        if not os.path.isdir(hist_dir):
+            _backfill_history(hist_dir, out_dir, data, tag, rules, share)
+        os.makedirs(hist_dir, exist_ok=True)
+        _write_if_changed(os.path.join(hist_dir, tag + '.json'), _snapshot(res, tag, data, hist_dir, rules, share))
+        _prune_history(hist_dir, share.HISTORY_DAYS)
+        return True
+    except Exception as e:
+        say('注意：今天的歷史紀錄沒有寫入（%s），分享版不受影響。' % (e if isinstance(e, ValueError) else type(e).__name__))
+        return False
 
 
 CSV_HEAD = ['代號', '名稱', '資料日期', '型態', '收盤', '漲跌%', '量比', '建議停損', '停損距離%', '股數(設定風險)', '金額(設定風險)',
-            '股數(5%)', '金額(5%)', '0週線', '1趨勢', '2動能', '3量能', 'A突破', 'B回測', '說明', '停損依據', '備註', '類股']
+            '股數(5%)', '金額(5%)', '0週線', '1趨勢', '2動能', '3量能', 'A突破', 'B回測', '說明', '停損依據', '備註', '類股', '市場']
 
 
 def write_csv(path, res, capital):
@@ -1669,10 +2680,10 @@ def write_csv(path, res, capital):
             w.writerow([f'="{r["code"]}"', r['name'], r['date'], r.get('type', ''), r['close'], r['chg'], r['vol_ratio'],
                         r.get('stop', ''), dist] + pos
                        + [yn(s[0]), yn(s[1]), yn(s[2]), yn(s[3]), yn(s['A']), yn(s['B']),
-                          r.get('setup', ''), r.get('stop_why', ''), '；'.join(r['notes']), r.get('sector', '')])
+                          r.get('setup', ''), r.get('stop_why', ''), '；'.join(r['notes']), r.get('sector', ''), r.get('market', '')])
         for r in res:
             if 'error' in r:
-                w.writerow([f'="{r["code"]}"', r['name']] + [''] * 19 + [r['error'], r.get('sector', '')])
+                w.writerow([f'="{r["code"]}"', r['name']] + [''] * 19 + [r['error'], r.get('sector', ''), r.get('market', '')])
 
 
 # ---------- 指令 ----------
@@ -1730,7 +2741,7 @@ def _share_rules(share, cfg, capital, amounts, data_dir, out_dir, list_path=None
                             repo=cfg['share_repo'] if cfg else None, sectors=SECTOR_LABELS)
 
 
-def build_share_page(res, o, a, tag, wl, sinfo=None):
+def build_share_page(res, o, a, tag, wl, sinfo=None, charts=None):
     """產生分享版並做安全檢查，通過才寫檔（回傳路徑）。不能產生或沒通過：不寫檔、刪掉同一天舊的分享版、
     印出原因，回傳 None。不影響選股結果。"""
     out_dir = o['out_dir']
@@ -1741,12 +2752,14 @@ def build_share_page(res, o, a, tag, wl, sinfo=None):
         say('注意：沒有結果資料夾（--out-dir 或設定檔的 output_dir），所以沒有產生分享版。')
         return None
     path = os.path.join(out_dir, f'分享版_{tag}.html')
+    pwa = bool(o['cfg'] and o['cfg'].get('share_pwa'))
+    rules = None
     try:
         import share
-        data = render_share_html(res, sinfo).encode('utf-8')
+        data = render_share_html(res, sinfo, charts, pwa).encode('utf-8')
         amounts = [v for r in res for s in (r.get('size') or []) for v in (s['shares'], s['amount'])]
         rules = _share_rules(share, o['cfg'], o['capital'], amounts, a.data, out_dir, o['list'])
-        problems = share.check_html(data, rules)
+        problems = share.check_html(data, rules, pwa) if pwa else share.check_html(data, rules)
     except Exception as e:
         problems = ['%s' % (e if isinstance(e, ValueError) else '%s: %s' % (type(e).__name__, e))]
     if problems:
@@ -1764,6 +2777,8 @@ def build_share_page(res, o, a, tag, wl, sinfo=None):
     with open(tmp, 'wb') as f:
         f.write(data)
     os.replace(tmp, path)
+    if pwa and rules is not None:
+        update_share_history(share_history_dir(o['cfg']), res, a.data, out_dir, rules)
     return path
 
 
@@ -1774,15 +2789,21 @@ def cmd_scan(a):
         raise UserError(E_NEED_DATA, f'找不到股價資料：資料夾「{a.data}」不存在或裡面沒有任何 .csv。',
                         '請先雙擊 setup.bat 並選擇「現在下載」，或在程式資料夾執行 python fetch_data.py backfill。')
     wl = load_list(o['list'])
-    res = []
+    res, charts = [], {}
     todo = [(code, path) for code, path in files(a.data) if wl is None or code in wl]
     for (code, path), (_, raw) in zip(todo, prefetch([p for _, p in todo])):
         name, bars = load_file(path, raw)
         r = analyze(code, (wl or {}).get(code) or name, bars)
         size(r, capital, risk)
+        if 'error' not in r and (r.get('type') or r.get('watch')):
+            try:
+                charts[code] = chart_code(chart_series(bars))
+            except (ValueError, ZeroDivisionError, OverflowError):
+                pass
         res.append(r)
     ind = load_industry(industry_dir(a.data))
     attach_sectors(res, ind['rows'])
+    attach_markets(res, load_market(a.data))
     missing = []
     if wl is not None:
         if not res:
@@ -1816,12 +2837,12 @@ def cmd_scan(a):
     if html_path:
         meta = dict(capital=capital, risk=risk, list_path=o['list'], list_count=len(wl) if wl else 0, missing=missing,
                     today=dt.date.today().isoformat(), generated=dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
-                    sector_info=sinfo)
+                    sector_info=sinfo, charts=charts)
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(render_html(res, wl is not None, meta))
     if csv_path:
         write_csv(csv_path, res, capital)
-    share_path = build_share_page(res, o, a, tag, wl, sinfo) if o['share'] else None
+    share_path = build_share_page(res, o, a, tag, wl, sinfo, charts) if o['share'] else None
     if not md_path:
         sys.stdout.write(md)
     if any((html_path, csv_path, md_path, txt_path, json_path)):
@@ -1846,12 +2867,21 @@ def cmd_share(a):
             token = parse_repo(token) or ''
         except ValueError as e:
             raise UserError(share.E_SHARE, f'--confirm-first-publish 後面的寫法不對：{e}。', '例如 --confirm-first-publish yourname/tw-stock-screener-results')
+    pwa_token = getattr(a, 'confirm_pwa', None)
+    if pwa_token is not None:
+        try:
+            pwa_token = parse_repo(pwa_token) or ''
+        except ValueError as e:
+            raise UserError(share.E_SHARE, f'--confirm-pwa 後面的寫法不對：{e}。', '例如 --confirm-pwa yourname/tw-stock-screener-results')
     try:
         if a.takedown is not None:
             repo = parse_repo(a.takedown) if a.takedown else (cfg['share_repo'] or share.load_state(SHARE_STATE).get('repo'))
             return share.takedown(repo, SHARE_STATE, say)
+        if pwa_token is not None and not cfg['share_pwa']:
+            raise UserError(share.E_SHARE, '設定檔的 share_pwa 沒有打開，所以 --confirm-pwa 不能用。',
+                            '要公開 PWA 版：在 設定.txt 把 share_pwa 改成 1 後再執行；只公開 index.html 和 README.md 兩個檔案的版本，請用 --confirm-first-publish。')
         if not cfg['share_publish']:
-            if token is not None:
+            if token is not None or pwa_token is not None:
                 raise UserError(share.E_SHARE, '設定檔的 share_publish 沒有打開，所以不會公開。', '在 設定.txt 把 share_publish 改成 1 後再執行。')
             return 0
         out_dir = cfg['output_dir']
@@ -1863,6 +2893,12 @@ def cmd_share(a):
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             pass
         rules = _share_rules(share, cfg, cfg['capital'], amounts, os.path.join(HERE, 'data'), out_dir)
+        if cfg['share_pwa']:
+            if token is not None:
+                raise UserError(share.E_SHARE, '設定檔的 share_pwa 打開了，PWA 版要用 --confirm-pwa 確認，不能用 --confirm-first-publish。',
+                                '例如 --confirm-pwa yourname/tw-stock-screener-results；或雙擊 run.bat，看到問題時輸入 Y。')
+            return share.publish_pwa(cfg['share_repo'], cfg['mode'], out_dir, share_history_dir(cfg), SHARE_STATE, rules, ask=a.ask,
+                                     token=pwa_token, say=say)
         return share.publish(cfg['share_repo'], cfg['mode'], out_dir, SHARE_STATE, rules, ask=a.ask, token=token, say=say)
     except share.ShareError as e:
         raise UserError(e.code, e.cause, e.todo)
@@ -1976,6 +3012,7 @@ def main():
     sg = sh.add_mutually_exclusive_group(required=True)
     sg.add_argument('--publish', action='store_true')
     sg.add_argument('--confirm-first-publish', metavar='帳號/儲存庫')
+    sg.add_argument('--confirm-pwa', metavar='帳號/儲存庫')
     sg.add_argument('--takedown', nargs='?', const='', metavar='帳號/儲存庫')
     sh.add_argument('--ask', action='store_true')
     sh.set_defaults(f=cmd_share)

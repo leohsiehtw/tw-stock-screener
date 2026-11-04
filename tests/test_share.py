@@ -631,8 +631,9 @@ class TestScanShare(tu.TempCase):
         self.assertEqual(share.check_html(raw, share.make_rules(capital=1000000, paths=[self.tmp, ROOT],
                                                                  sectors=screener.SECTOR_LABELS)), [])
         self.assertNotIn(b'1000000', raw)
+        self.assertEqual(raw.count(b' data-ch="'), 4)
         self.assertIn('分享版：' + os.path.abspath(p), err)
-        self.assertEqual(raw.decode('utf-8'), make_page(tweak=lambda res: (res.pop(), screener.attach_sectors(res, {}))))     # 和直接產生的一樣（少了 9999 那筆）
+        self.assertEqual(re.sub(r' data-ch="[A-Za-z]+"', '', raw.decode('utf-8')), make_page(tweak=lambda res: (res.pop(), screener.attach_sectors(res, {}))))     # 和直接產生的一樣（少了 9999 那筆）
         self.assertFalse([n for n in os.listdir(out) if n.endswith('.tmp')])
 
     def test_share_publish_in_config_also_generates(self):
@@ -734,6 +735,8 @@ class FakeGh:
         self.calls, self.login, self.uid = [], login, uid
         self.repo, self.files, self.pages = None, {}, False
         self.script, self.post_pages, self.repo_404_after_create = [], [], 0
+        self.commit_n, self.truncated, self.blobs, self.pending, self.pending_c = 0, False, {}, {}, {}      # git data 端點用
+        self.blob_posts, self.tree_bodies, self.commit_bodies, self.patches = [], [], [], []
 
     @staticmethod
     def ok(obj=None):
@@ -795,11 +798,14 @@ class FakeGh:
                 if name in self.files and body.get('sha') != share.blob_sha(self.files[name]):
                     return self.err(409, 'sha mismatch')
                 self.files[name] = base64.b64decode(body['content'])
+                self.commit_n += 1
                 self.last_put = body
                 return self.ok(dict(content=dict(sha=share.blob_sha(self.files[name]))))
             if name not in self.files:
                 return self.err(404, 'Not Found')
             return self.ok(dict(name=name, sha=share.blob_sha(self.files[name])))
+        if sub.startswith('/git/'):
+            return self.git(sub[5:], method, kw)
         if sub == '/pages':
             if method == 'DELETE':
                 self.pages = False
@@ -812,6 +818,53 @@ class FakeGh:
                 return self.ok(dict(html_url='x'))
             return self.ok(dict(status='built')) if self.pages else self.err(404, 'Not Found')
         raise AssertionError(a)
+
+    def git(self, sub, method, kw):
+        """Git Data API（PWA 公開用）：ref、commit、tree、blob；檔案清單就是 self.files（路徑 → 位元組）"""
+        body = json.loads(kw['input'].decode('utf-8')) if kw.get('input') else None
+        if sub.startswith('ref/heads/'):
+            if not self.files:
+                return self.err(409, 'Git Repository is empty.')
+            return self.ok(dict(object=dict(sha='c%d' % self.commit_n)))
+        if sub.startswith('commits/'):
+            return self.ok(dict(tree=dict(sha='t' + sub.split('/')[1])))
+        if sub.startswith('trees/') and method == 'GET':
+            ents = [dict(path=p, mode='100644', type='blob', sha=share.blob_sha(b)) for p, b in sorted(self.files.items())]
+            ents += [dict(path=d, mode='040000', type='tree', sha='d') for d in sorted({p.split('/')[0] for p in self.files if '/' in p})]
+            return self.ok(dict(tree=ents, truncated=self.truncated))
+        if sub.startswith('blobs/') and method == 'GET':
+            sha = sub.split('/')[1]
+            for b in list(self.files.values()) + list(self.blobs.values()):
+                if share.blob_sha(b) == sha:
+                    return self.ok(dict(content=base64.encodebytes(b).decode('ascii'), encoding='base64', sha=sha))
+            return self.err(404, 'Not Found')
+        if sub == 'blobs' and method == 'POST':
+            b = base64.b64decode(body['content'])
+            self.blobs[share.blob_sha(b)] = b
+            self.blob_posts.append(b)
+            return self.ok(dict(sha=share.blob_sha(b)))
+        if sub == 'trees' and method == 'POST':
+            files = dict(self.files)
+            for e in body['tree']:
+                if e['sha'] is None:
+                    files.pop(e['path'], None)
+                else:
+                    files[e['path']] = self.blobs[e['sha']]
+            self.tree_bodies.append(body)
+            self.pending['nt%d' % len(self.tree_bodies)] = files
+            return self.ok(dict(sha='nt%d' % len(self.tree_bodies)))
+        if sub == 'commits' and method == 'POST':
+            self.commit_bodies.append(body)
+            self.pending_c['nc%d' % len(self.commit_bodies)] = self.pending[body['tree']]
+            return self.ok(dict(sha='nc%d' % len(self.commit_bodies)))
+        if sub.startswith('refs/heads/') and method == 'PATCH':
+            if body['sha'] not in self.pending_c:
+                return self.err(422, 'Update is not a fast forward')
+            self.files = self.pending_c[body['sha']]
+            self.commit_n += 1
+            self.patches.append(body)
+            return self.ok(dict())
+        raise AssertionError(sub)
 
 
 class GhCase(tu.TempCase):
@@ -1422,7 +1475,7 @@ class TestShareStatic(unittest.TestCase):
 
     def test_line_endings(self):
         for name, crlf in (('share.py', True), ('screener.py', True), ('設定.範例.txt', True), ('run.bat', True),
-                           (os.path.join('tests', 'test_share.py'), False), ('README.md', False), ('CHANGELOG.md', False)):
+                           (os.path.join('tests', 'test_share.py'), False), (os.path.join('tests', 'test_pwa.py'), False), ('README.md', False), ('CHANGELOG.md', False)):
             b = self.raw(name)
             self.assertFalse(b.startswith(b'\xef\xbb\xbf'), name)
             if crlf:
@@ -1490,6 +1543,8 @@ class TestShareSector(unittest.TestCase):
             'data-sec path': page.replace('data-sec="傳產-水泥"', 'data-sec="C:/x"', 1),
             'data-sec name': page.replace('data-sec="傳產-水泥"', 'data-sec="鴻海"', 1),
             'data-sec html': page.replace('data-sec="傳產-水泥"', 'data-sec="a&lt;b"', 1),
+            'data-mkt bad': page.replace('data-mkt=""', 'data-mkt="興櫃"', 1),
+            'data-mkt path': page.replace('data-mkt=""', 'data-mkt="C:/x"', 1),
         }
         for name, bad in cases.items():
             with self.subTest(name):
@@ -1508,6 +1563,58 @@ class TestShareSector(unittest.TestCase):
         self.assertEqual(share.check_html(page, self.rules()), [])
         for label in screener.SECTOR_ORDER:
             self.assertIn(('data-sec="%s"' % label).encode('utf-8'), page)
+
+    def test_etf_subtype_chips(self):
+        """類別選 ETF 時的子類按鈕：檔數多到少、預設隱藏、按鈕有 aria-pressed；data-sub 也要在類股清單裡"""
+        res = tu.fake_results()
+        extra = [tu.fake_rec('00679B', '元大美債20年', 30.0, 0.1, 0.9, '回測型', 29.0),
+                 tu.fake_rec('00720B', '元大投資級公司債', 33.0, 0.1, 0.9, '回測型', 32.0),
+                 tu.fake_rec('00929', '復華台灣科技優息', 18.0, 0.2, 0.8, '回測型', 17.5)]
+        for r in extra:
+            screener.size(r, 1000000, 0.02)
+        res = res[:3] + extra + res[3:]
+        for r in res:
+            r['sector'] = screener.sector_of(r['code'], r['name'], {'1101': '01', '2330': '24'}) if 'error' not in r else ''
+        page = screener.render_share_html(res, {'status': 'ok', 'fetched': '2026-10-20'})
+        self.assertEqual(share.check_html(page.encode('utf-8'), self.rules()), [])
+        m = re.search(r'<div class="seg subs" id="csub" role="group" aria-label="ETF 子類" hidden>(.*?)</div>', page)
+        self.assertTrue(m, 'csub')
+        chips = re.findall(r'<button type="button" class="chip" data-sub="([^"]+)" aria-pressed="(true|false)">([^<]+)</button>', m.group(1))
+        self.assertEqual(chips, [('all', 'true', '全部 4'), ('ETF-債券', 'false', '債券 2'), ('ETF-科技', 'false', '科技 1'),
+                                 ('ETF-海外', 'false', '海外 1')])
+        for s in ("getElementById('csub')", "lastK === 'etf'", 'isSub('):
+            self.assertIn(s, screener.SHARE_JS, s)
+        cases = {
+            'data-sub path': page.replace('data-sub="ETF-債券"', 'data-sub="C:/x"', 1),
+            'data-sub unknown label': page.replace('data-sub="ETF-債券"', 'data-sub="ETF-鴻海"', 1),
+            'data-sub on span': page.replace('<p class="sublg" aria-hidden="true">', '<p class="sublg" aria-hidden="true" data-sub="all">', 1),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self.assertNotEqual(bad, page)
+                self.assertTrue(share.check_html(bad.encode('utf-8'), self.rules()), name)
+        # 沒有 ETF 候選：不出現子類列
+        plain = screener.render_share_html([r for r in res if not screener.IS_ETF.match(r['code'])], {'status': 'ok', 'fetched': '2026-10-20'})
+        self.assertNotIn('id="csub"', plain)
+
+    def test_market_chip_and_validation(self):
+        res = tu.fake_results()
+        for r in res:
+            r['sector'] = {'1101': '傳產-水泥', '00646': 'ETF-海外'}.get(r['code'], '')
+        screener.attach_markets(res, {'1101': '上市', '00646': '上櫃'})
+        page = screener.render_share_html(res, {'status': 'ok', 'fetched': '2026-10-20'})
+        self.assertEqual(share.check_html(page.encode('utf-8'), self.rules()), [])
+        for s in ('data-mkt="上市"', 'data-mkt="上櫃"', 'data-mkt=""', '<span class="kd">個股·上市</span>',
+                  '<span class="kd">ETF·上櫃</span>', '<span class="kd">個股</span>'):
+            self.assertIn(s, page, s)
+        self.assertEqual({r['code']: r['market'] for r in screener.share_rows(res)}['1101'], '上市')
+        for bad in ('興櫃', 'TWSE', 5, None, '上市 '):
+            res[0]['market'] = bad
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                screener.share_rows(res)
+        for r in res:
+            r.pop('market', None)
+        self.assertTrue(all(r['market'] == '' for r in screener.share_rows(res)))       # 舊資料沒有 market
 
     def test_watchlist_name_equal_to_label_word(self):
         wl = {'1234': '半導體'}
@@ -1569,6 +1676,88 @@ class TestShareSector(unittest.TestCase):
             t0 = time.time()
             share._mask_watch_text(text, [], [])
             self.assertLess(time.time() - t0, 3, text[:10])
+
+
+# ---------- 分享版的 K 線圖資料（data-ch） ----------
+def _fake_code(i, n=2000):
+    """測試用的假資料：只要是英文字母就好（不一定解得出來）"""
+    import random
+    r = random.Random(i)
+    return ''.join(r.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(n))
+
+
+class TestShareChart(unittest.TestCase):
+    CODES = ('1101', '2330', '00646', '6874')
+
+    @classmethod
+    def setUpClass(cls):
+        cls.charts = {c: tu.screener.chart_code(tu.screener.chart_series(tu.rw_bars(150, i + 1))) for i, c in enumerate(cls.CODES + ('2454',))}
+        cls.page = screener.render_share_html(tu.fake_results(), None, cls.charts)
+
+    def rules(self):
+        return share.make_rules(capital=1000000, amounts=[v for r in tu.fake_results() for s in (r.get('size') or []) for v in (s['shares'], s['amount'])],
+                                paths=[ROOT, r'C:\Users\lh'], watchlist={'2454': '聯發科', '1216': '統一'}, repo='someowner/my-results',
+                                people=('someuser', 'SOMEPC'), sectors=screener.SECTOR_LABELS)
+
+    def test_t9_page_with_charts(self):
+        h = self.page
+        self.assertEqual(h.count(' data-ch="'), 4)
+        for c in self.CODES:
+            self.assertIn(self.charts[c], h)
+        self.assertNotIn(self.charts['2454'], h)
+        self.assertEqual(h.count('<script'), 2)
+        self.assertEqual(share.check_html(h.encode('utf-8'), self.rules()), [])
+        self.assertLess(len(h.encode('utf-8')), screener.SHARE_CHART_BUDGET)
+        res2 = tu.fake_results(capital=2000000)
+        self.assertEqual(screener.render_share_html(res2, None, self.charts), h)
+        self.assertEqual(screener.render_share_html(tu.fake_results(), None, {}), screener.render_share_html(tu.fake_results()))
+
+    def check(self, h):
+        return share.check_html(h.encode('utf-8'), self.rules())
+
+    def test_t10_negatives(self):
+        first = re.search(r' data-ch="([a-z]+|[A-Za-z]+)"', self.page).group(1)
+        for v in ('abc123def', '&lt;svg onload=x&gt;', '&quot;', 'abcdefg', 'a' * 8001, ''):
+            self.assertTrue(self.check(self.page.replace(' data-ch="%s"' % first, ' data-ch="%s"' % v, 1)), v[:20])
+        ok = 'abcdefgh'
+        for el in ('<div data-ch="%s"></div>', '<table><tr data-ch="%s"></tr></table>', '<table><tbody data-ch="%s"></tbody></table>',
+                   '<button type="button" data-ch="%s">x</button>'):
+            self.assertTrue(self.check(self.page.replace('<main>', '<main>' + el % ok, 1)), el)
+        for el in ('<svg></svg>', '<svg onload="x"></svg>', '<path d="M0 0"></path>', '<foreignObject></foreignObject>',
+                   '<use href="#cands"></use>', '<image></image>', '<script type="application/json">[1,2]</script>', '<p>[12,345,6]</p>'):
+            self.assertTrue(self.check(self.page.replace('<main>', '<main>' + el, 1)), el)
+        self.assertEqual(self.check(self.page), [])
+
+    def test_t11_budget(self):
+        res = [tu.fake_rec('%d' % (1100 + i), '標的%d' % i, 50 + i, 0.5, 1 + i / 100, '回測型', 45 + i) for i in range(150)]
+        charts = {r['code']: _fake_code(i) for i, r in enumerate(res)}
+        h = screener.render_share_html(res, None, charts)
+        n = h.count(' data-ch="')
+        self.assertTrue(0 < n < 150, n)
+        self.assertLess(len(h.encode('utf-8')), screener.SHARE_CHART_BUDGET)
+        order = [r['code'] for r in screener.share_rows(res)]
+        have = [c for c in order if self.chart_of(h, c)]
+        self.assertEqual(have, order[:n])
+        self.assertEqual(share.check_html(h.encode('utf-8'), share.make_rules(capital=1000000, paths=[ROOT], sectors=screener.SECTOR_LABELS)), [])
+        print('\n[T11] 150 檔、每檔約 2 KB：%d 檔有圖，頁面 %d bytes' % (n, len(h.encode('utf-8'))))
+
+    @staticmethod
+    def chart_of(h, code):
+        return re.search(r'data-code="%s"[^>]* data-ch="[A-Za-z]+"' % code, h) is not None
+
+    def test_t12_bad_charts_raise(self):
+        res = tu.fake_results()
+        for bad in ({'1101': 123}, {'1101': 'abc123abc'}, {'1101': 'short'}, {1101: 'abcdefgh'}, {'1101': None}, {'1101': 'a' * 8001}):
+            with self.assertRaises(ValueError, msg=str(bad)[:30]):
+                screener.render_share_html(res, None, bad)
+
+    def test_t13_hostile_name_with_chart(self):
+        res = tu.fake_results()
+        res[0]['name'] = '<img src=x onerror=alert(1)>'
+        h = screener.render_share_html(res, None, self.charts)
+        self.assertNotIn('<img', h)
+        self.assertEqual(h.count('<script'), 2)
+        self.assertEqual(h.count(' data-ch="'), 4)
 
 
 if __name__ == '__main__':

@@ -291,11 +291,21 @@ class TestRender(unittest.TestCase):
         self.assertEqual(set(screener.PALETTE['light']), set(screener.PALETTE['dark']))
 
     def test_contrast(self):
-        """文字對背景 ≥ 4.5:1；按鈕文字 ≥ 4.5:1；圖形記號、焦點框、輸入框邊線 ≥ 3:1（淺色、深色都要）"""
+        """主要、次要文字 ≥ 7:1（AAA）；其他文字 ≥ 4.5:1；按鈕文字 ≥ 4.5:1；有意義的框線（ink3）≥ 4.5:1；
+        圖形記號、焦點框 ≥ 3:1（淺色、深色都要）"""
         for mode, p in screener.PALETTE.items():
             for fg in TEXT_TOKENS:
                 for bg in BACKGROUNDS:
-                    self.assertGreaterEqual(wcag_ratio(p[fg], p[bg]), 4.5, f'{mode} {fg} on {bg}')
+                    need = 7 if fg in ('ink', 'ink2') else 4.5
+                    self.assertGreaterEqual(wcag_ratio(p[fg], p[bg]), need, f'{mode} {fg} on {bg}')
+                self.assertGreaterEqual(wcag_ratio(p['ink3'], p[bg]), 4.5, f'{mode} 框線 ink3 on {bg}')
+            for fg in ('up', 'down', 'cap'):
+                for bg in ('page', 'surface'):      # 數字的漲跌色也到 7:1
+                    self.assertGreaterEqual(wcag_ratio(p[fg], p[bg]), 7, f'{mode} {fg} on {bg}')
+            # 價位條：布林帶要看得出來，停損價（warn）與收盤點（ink）畫在帶上也要看得清楚
+            self.assertGreaterEqual(wcag_ratio(p['band'], p['surface']), 1.7, f'{mode} band')
+            self.assertGreaterEqual(wcag_ratio(p['warn'], p['band']), 3.5, f'{mode} warn on band')
+            self.assertGreaterEqual(wcag_ratio(p['ink'], p['band']), 4.5, f'{mode} ink on band')
             for bg in ('btn', 'btn_hover', 'btn_active'):
                 self.assertGreaterEqual(wcag_ratio(p['on_btn'], p[bg]), 4.5, f'{mode} on_btn on {bg}')
             self.assertGreaterEqual(wcag_ratio(p['page'], p['ink']), 4.5, f'{mode} 選取中的篩選按鈕')
@@ -410,13 +420,13 @@ class TestCsv(TempCase):
         rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'), newline='')))
         self.assertEqual(rows[0], screener.CSV_HEAD)
         self.assertEqual(rows[0][:5], ['代號', '名稱', '資料日期', '型態', '收盤'])
-        self.assertEqual(rows[0][-4:], ['說明', '停損依據', '備註', '類股'])
+        self.assertEqual(rows[0][-5:], ['說明', '停損依據', '備註', '類股', '市場'])
         self.assertTrue(all(len(r) == len(rows[0]) for r in rows))
         codes = [r[0] for r in rows[1:]]
         self.assertIn('="0050"', codes)
         self.assertEqual(codes[-1], '="9999"')              # 錯誤列排最後
-        self.assertIn('資料只有 10 天', rows[-1][-2])
-        self.assertEqual(rows[-1][-1], '')
+        self.assertIn('資料只有 10 天', rows[-1][-3])
+        self.assertEqual(rows[-1][-2:], ['', ''])
         self.assertEqual([bool(r[3]) for r in rows[1:]], [True] * 4 + [False] * 4)     # 候選在前，其餘在後，錯誤列最後
         first = rows[1]
         self.assertIn(first[13], ('是', '否'))
@@ -1794,15 +1804,63 @@ class TestSectorTables(unittest.TestCase):
         self.assertEqual(f('0050', '元大台灣50', {'0050': '24'}), 'ETF-市值型')       # ETF 不看快取
 
     def test_etf_types(self):
-        want = {'00631L': ('元大台灣50正2', 'ETF-槓桿反向'), '00632R': ('元大台灣50反1', 'ETF-槓桿反向'),
-                '00719B': ('元大美債1-3', 'ETF-債券'), '00635U': ('期元大S&P黃金', 'ETF-商品期貨'),
-                '0056': ('元大高股息', 'ETF-高股息'), '00940': ('元大台灣價值高息', 'ETF-高股息'),
-                '0050': ('元大台灣50', 'ETF-市值型'), '00646': ('元大Ｓ＆Ｐ５００', 'ETF-市值型'),
-                '00916': ('國泰全球品牌', 'ETF-其他'), '00400A': ('主動國泰動能高息', 'ETF-高股息'),
-                '00679B': ('', 'ETF-債券'), '00xxx': (None, 'ETF-其他')}
-        for code, (name, label) in want.items():
-            self.assertEqual(screener.etf_type(code, name), label, code)
-            self.assertIn(label, screener.SECTOR_LABELS)
+        want = [
+            ('00631L', '元大台灣50正2', 'ETF-槓桿反向'), ('00632R', '元大台灣50反1', 'ETF-槓桿反向'),
+            ('00680L', '元大美債20正2', 'ETF-槓桿反向'),                       # 槓桿反向勝過債券
+            ('00719B', '元大美債1-3', 'ETF-債券'), ('00679B', '', 'ETF-債券'), ('00687C', '國泰20年美債+櫃U', 'ETF-債券'),
+            ('00635U', '期元大S&P黃金', 'ETF-商品期貨'), ('009832', '兆豐美國黃金', 'ETF-商品期貨'),
+            ('00400A', '主動國泰動能高息', 'ETF-主動式'), ('00985A', '主動野村台灣50', 'ETF-主動式'),
+            ('00981D', '主動中信非投等債', 'ETF-主動式'),                      # D 尾碼：主動式債券，算主動式
+            ('00980T', '平衡凱基美國TOP', 'ETF-主動式'),                        # T 尾碼：平衡型，算主動式
+            ('00999X', '主動測試', 'ETF-主動式'),                               # 尾碼不認得也看名稱
+            ('0056', '元大高股息', 'ETF-高股息'), ('00940', '元大台灣價值高息', 'ETF-高股息'),
+            ('00878', '國泰永續高股息', 'ETF-高股息'),                          # 高股息勝過永續
+            ('00932', '兆豐永續高息等權', 'ETF-高股息'),                        # 高股息勝過永續、策略
+            ('00929', '復華台灣科技優息', 'ETF-科技'), ('00927', '群益半導體收益', 'ETF-科技'),   # ETF_OVERRIDE：科技為主的高息
+            ('00943', '兆豐電子高息等權', 'ETF-科技'), ('00946', '群益科技高息成長', 'ETF-科技'),
+            ('00962', '台新AI優息動能', 'ETF-科技'), ('00896', '中信綠能及電動車', 'ETF-科技'),
+            ('009805', '台新美國電力基建', 'ETF-主題'),                          # 電力基建：公用事業，不算科技
+            ('00903', '富邦元宇宙', 'ETF-科技'),
+            ('00850', '元大臺灣ESG永續', 'ETF-永續'), ('00923', '群益台ＥＳＧ低碳50', 'ETF-永續'),
+            ('00897', '富邦基因免疫生技', 'ETF-主題'), ('00965', '元大航太防衛科技', 'ETF-主題'),      # 主題勝過科技
+            ('009817', '國泰日本不動產', 'ETF-主題'), ('00908', '富邦入息REITs+', 'ETF-主題'),
+            ('0055', '元大MSCI金融', 'ETF-金融'), ('009825', '聯邦美國金融創新', 'ETF-金融'),
+            ('0052', '富邦科技', 'ETF-科技'), ('00881', '富邦台灣科技', 'ETF-科技'),                   # 有主題字就不是市值型
+            ('00770', '國泰北美科技', 'ETF-科技'), ('00830', '國泰費城半導體', 'ETF-科技'),            # 主題勝過地區
+            ('00952', '凱基台灣AI50', 'ETF-科技'), ('00757', '統一ＦＡＮＧ＋', 'ETF-科技'),
+            ('00646', '元大Ｓ＆Ｐ５００', 'ETF-海外'), ('00662', '富邦NASDAQ', 'ETF-海外'),           # 地區勝過市值型
+            ('009818', '華南永昌NASDAQxT', 'ETF-海外'), ('00645', '富邦日本', 'ETF-海外'),
+            ('00639', '富邦深100', 'ETF-海外'), ('00916', '國泰全球品牌50', 'ETF-海外'),
+            ('0050', '元大台灣50', 'ETF-市值型'), ('006208', '富邦台50', 'ETF-市值型'), ('0051', '元大中型100', 'ETF-市值型'),
+            ('00690', '兆豐藍籌30', 'ETF-市值型'), ('009810', '玉山全球藍籌100', 'ETF-海外'),       # 地區勝過藍籌
+            ('00905', 'FT臺灣Smart', 'ETF-策略'),                               # Smart 不是 AI，也不是科技
+            ('00921', '兆豐龍頭等權重', 'ETF-策略'), ('009803', '玉山市值動能50', 'ETF-策略'),      # 策略勝過市值
+            ('00733', '富邦臺灣中小', 'ETF-策略'), ('00643', '群益深証中小', 'ETF-海外'),
+            ('00728', '第一金工業30', 'ETF-其他'), ('009804', '聯邦台精彩50', 'ETF-其他'),
+            ('00999', 'TAIWAN', 'ETF-其他'),                                    # AI 前後緊接大寫英文字母不算
+            ('00xxx', None, 'ETF-其他'), ('', '', 'ETF-其他'),
+        ]
+        self.assertGreaterEqual(len(want), 25)
+        for code, name, label in want:
+            self.assertEqual(screener.etf_type(code, name), label, (code, name))
+            self.assertIn(label, screener.ETF_LABELS)
+        self.assertEqual(set(l for _, _, l in want), set(screener.ETF_LABELS))      # 每一類都有例子
+
+    def test_etf_label_set(self):
+        import share
+        self.assertEqual(screener.ETF_LABELS, ('ETF-槓桿反向', 'ETF-主動式', 'ETF-債券', 'ETF-商品期貨', 'ETF-高股息', 'ETF-永續',
+                                               'ETF-主題', 'ETF-金融', 'ETF-科技', 'ETF-海外', 'ETF-策略', 'ETF-市值型', 'ETF-其他'))
+        self.assertEqual(screener.SECTOR_ORDER[-len(screener.ETF_LABELS):], screener.ETF_LABELS)
+        for l in screener.ETF_LABELS:
+            self.assertTrue(share.SECTOR_RE.fullmatch(l), l)
+            self.assertNotEqual(l, 'ETF')
+            self.assertLessEqual(len(l), 8, l)                     # 選單在手機上不會太寬
+            self.assertTrue(re.fullmatch(r'ETF-[\u4e00-\u9fff]{2,4}', l), l)      # 除了開頭的 ETF 沒有英文字母和數字
+            for w in share.FORBIDDEN_WORDS:
+                self.assertNotIn(w, l)
+        for label, letters, words in screener.ETF_TYPES:
+            self.assertTrue(words, label)
+            self.assertTrue(all(c.isupper() for c in letters), label)
 
 
 class TestIndustryCache(TempCase):
@@ -1852,9 +1910,33 @@ class TestIndustryCache(TempCase):
         res.append(fake_rec('0050', '元大台灣50', 150.0, 0.1, 1.0))
         screener.attach_sectors(res, {'1101': '01', '2330': '24'})
         self.assertEqual([r['sector'] for r in res],
-                         ['傳產-水泥', '科技-半導體', 'ETF-市值型', '', '', '', '', 'ETF-市值型'])
+                         ['傳產-水泥', '科技-半導體', 'ETF-海外', '', '', '', '', 'ETF-市值型'])
         for r in res:
             self.assertEqual(list(r)[-1], 'sector')
+        screener.attach_markets(res, {'1101': '上市', '0050': '上市', '6488': '上櫃'})
+        for r in res:
+            self.assertEqual(list(r)[-2:], ['sector', 'market'])
+        self.assertEqual({r['code']: r['market'] for r in res}['1101'], '上市')
+        self.assertEqual({r['code']: r['market'] for r in res}['2330'], '')
+        screener.attach_markets(res, None)
+        self.assertTrue(all(r['market'] == '' for r in res))
+
+    def test_load_market(self):
+        m = screener.load_market(os.path.join(self.tmp, 'data'))         # 沒有 cache 資料夾
+        self.assertEqual(m, {})
+        c = os.path.join(self.tmp, 'cache')
+        write(os.path.join(c, 'twse', '20261029.json'), json.dumps({'date': '2026-10-29', 'rows': [['1101', '台泥'], ['0099', 'x']]}))
+        write(os.path.join(c, 'twse', '20261030.json'), json.dumps({'date': '2026-10-30', 'rows': [['1101', '台泥'], ['0050', '元大台灣50']]}))
+        write(os.path.join(c, 'twse', '20261031.json'), json.dumps({'date': '2026-10-31', 'rows': None}))      # 休市
+        write(os.path.join(c, 'tpex', '20261030.json'), 'not json')
+        write(os.path.join(c, 'tpex', '20261029.json'), json.dumps({'date': '2026-10-29', 'rows': [['00679B', 'y'], ['1101', 'z']]}))
+        write(os.path.join(c, 'tpex', 'notes.json'), json.dumps({'rows': [['9999', 'q']]}))
+        write(os.path.join(c, 'industry', 'tpex.json'), json.dumps({'rows': {'6488': '24', '1101': '01'}}))
+        write(os.path.join(c, 'industry', 'twse.json'), '\x00')
+        before = {os.path.join(r, f): readb(os.path.join(r, f)) for r, _, fs in os.walk(c) for f in fs}
+        m = screener.load_market(os.path.join(self.tmp, 'data'))
+        self.assertEqual(m, {'1101': '上市', '0050': '上市', '00679B': '上櫃', '6488': '上櫃'})       # 最新一天有資料的快照；上市優先
+        self.assertEqual({os.path.join(r, f): readb(os.path.join(r, f)) for r, _, fs in os.walk(c) for f in fs}, before)
 
 
 class TestSectorScan(TempCase):
@@ -1885,16 +1967,19 @@ class TestSectorScan(TempCase):
         j2 = json.loads(readb(os.path.join(o2, '盤後選股_%s.json' % tag)).decode('utf-8'))
         self.assertEqual(len(j1), 3)
         for a, b in zip(j1, j2):
-            self.assertEqual(list(a)[-1], 'sector')
-            self.assertEqual(list(b)[-1], 'sector')
+            self.assertEqual(list(a)[-2:], ['sector', 'market'])
+            self.assertEqual(list(b)[-2:], ['sector', 'market'])
             self.assertEqual(list(a), list(b))
-            self.assertEqual({k: v for k, v in a.items() if k != 'sector'}, {k: v for k, v in b.items() if k != 'sector'})
+            self.assertEqual({k: v for k, v in a.items() if k not in ('sector', 'market')},
+                             {k: v for k, v in b.items() if k not in ('sector', 'market')})
+        self.assertEqual({r['code']: r['market'] for r in j2}, {'1101': '上市', '2330': '上市', '0050': ''})
+        self.assertTrue(all(r['market'] == '' for r in j1))
         self.assertEqual({r['code']: r['sector'] for r in j2}['1101'], '傳產-水泥')
         self.assertEqual({r['code']: r['sector'] for r in j2}['2330'], '科技-半導體')
         self.assertEqual({r['code']: r['sector'] for r in j1}['1101'], '')
         for o in (o1, o2):
             rows = list(csv.reader(io.StringIO(readb(os.path.join(o, '盤後選股_%s.csv' % tag)).decode('utf-8-sig'), newline='')))
-            self.assertEqual(rows[0][-1], '類股')
+            self.assertEqual(rows[0][-2:], ['類股', '市場'])
             self.assertTrue(all(len(x) == len(rows[0]) for x in rows))
         h1 = readb(os.path.join(o1, '盤後選股_%s.html' % tag)).decode('utf-8')
         h2 = readb(os.path.join(o2, '盤後選股_%s.html' % tag)).decode('utf-8')
@@ -1962,13 +2047,34 @@ class TestSectorRender(unittest.TestCase):
         self.assertEqual(pack['s'], ['', '傳產-水泥', '傳產-食品', '科技-IC設計'])
         by = {r[0]: r[7] for r in pack['r']}
         self.assertEqual((by['1101'], by['1216'], by['2330']), (1, 2, 0))
-        self.assertIn('<span class="name">聯發科</span><span class="sec">科技-IC設計</span></th>', h)     # 觀察名單
+        self.assertIn('<span class="name">聯發科</span><span class="sec">科技-IC設計</span><span class="kd">個股</span></th>', h)     # 觀察名單
         self.assertIn('<th scope="col" class="lo"><button type="button" class="sb" data-key="2">類股', h)
 
     def test_old_results_without_sector_still_render(self):
         h = screener.render_html(fake_results(), False, meta_for())
         self.assertNotIn('id="csec"', h)
         self.assertIn('data-sec=""', h)
+        self.assertIn('data-mkt=""', h)
+
+    def test_etf_sub_labels_grouped_in_select(self):
+        h = self.page({'1101': '傳產-水泥', '00646': 'ETF-海外', '2330': 'ETF-主動式', '6874': 'ETF-科技'})
+        sel = h[h.index('id="csec"'):]
+        sel = sel[:sel.index('</select>')]
+        opts = re.findall(r'<option value="([^"]*)">([^<]*)</option>', sel)
+        vals = [v for v, _ in opts]
+        self.assertEqual(vals[vals.index('ETF'):], ['ETF', 'ETF-主動式', 'ETF-科技', 'ETF-海外'])
+        self.assertIn(('ETF', 'ETF（全部）3'), opts)
+        self.assertTrue(all(len(t) <= 12 for _, t in opts), opts)
+
+    def test_kind_market_chip(self):
+        res = sec_results({'1101': '傳產-水泥', '00646': 'ETF-海外'})
+        screener.attach_markets(res, {'1101': '上市', '00646': '上櫃'})
+        h = screener.render_html(res, False, meta_for(sector_info={'status': 'ok', 'fetched': '2026-10-20'}))
+        self.assertIn('<span class="sec">傳產-水泥</span><span class="kd">個股·上市</span>', h)
+        self.assertIn('<span class="sec">ETF-海外</span><span class="kd">ETF·上櫃</span>', h)
+        self.assertIn('data-mkt="上市"', h)
+        self.assertIn('<span class="kd">個股</span>', h)              # 查不到市場只寫個股／ETF
+        self.assertIn('.kd{', h)
 
 
 class TestThemeToggle(unittest.TestCase):
@@ -2006,14 +2112,25 @@ class TestThemeToggle(unittest.TestCase):
         P = screener.PALETTE
         for name in ('light', 'dark'):
             p = P[name]
-            self.assertGreaterEqual(wcag_ratio(p['ink2'], p['nav']), 4.5, name)
-            self.assertGreaterEqual(wcag_ratio(p['page'], p['ink']), 4.5, name)
+            self.assertGreaterEqual(wcag_ratio(p['ink2'], p['nav']), 7, name)
+            self.assertGreaterEqual(wcag_ratio(p['page'], p['ink']), 7, name)
             self.assertGreaterEqual(wcag_ratio(p['accent'], p['nav']), 3, name)
-            self.assertGreaterEqual(wcag_ratio(p['ink2'], p['page']), 4.5, name)
+            self.assertGreaterEqual(wcag_ratio(p['ink2'], p['page']), 7, name)
+            self.assertGreaterEqual(wcag_ratio(p['ink3'], p['nav']), 4.5, name)    # 主題切換鈕的外框
 
     def test_css_rules(self):
         css = screener.HTML_CSS
         self.assertLess(css.index('.tm:hover'), css.index('.tm[aria-pressed="true"]'))
+        # 點了馬上有反應：不用轉場動畫；可點的東西關掉雙擊縮放的等待
+        self.assertNotRegex(css, r'transition|animation|@keyframes')
+        for sel in ('.tm{', '.sb{', '.seg span{', '.btn{', '.chb{', 'details>summary{'):
+            rule = css[css.index(sel):]
+            self.assertIn('touch-action:manipulation', rule[:rule.index('}')], sel)
+        # 有意義的框線用實色 ink3，不用半透明的 hairline
+        for sel in ('.theme{', '.kd{', '.seg span{', '.fld input,.fld select{', '.pb-track{'):
+            rule = css[css.index(sel):]
+            self.assertIn('var(--ink3)', rule[:rule.index('}')], sel)
+        self.assertIn('Intl.Collator', screener.HTML_JS)
         self.assertIn('.navdate{display:none}', css[css.index('@media (max-width:734px)'):])
         self.assertNotRegex(css, r'(?<![A-Za-z-])lh(?![A-Za-z-])')
 
@@ -2145,6 +2262,284 @@ class TestIndustryFetch(TempCase):
             fetch_data._reset_net()
             self.assertEqual(fetch_data.cmd_daily(None), 0)          # 今天已經試過失敗 1 次：1 天後才再試，所以今天 0 次
             self.assertEqual([u for u in site.urls if 't187ap03' in u], [])
+
+# ---------- K 線圖資料（data-ch） ----------
+def rw_bars(n, seed, adjf=1.0, base=50.0, vol=500000, start=dt.date(2025, 6, 2)):
+    """隨機漫步的日線；close 是還原價，raw_close = close × adjf（只有最後一根會被 analyze／chart_series 拿來還原）"""
+    import random
+    rnd = random.Random(seed)
+    day, c, out = start, base, []
+    while len(out) < n:
+        if day.weekday() < 5:
+            o = c * (1 + rnd.gauss(0, 0.01))
+            c = max(0.01, o * (1 + rnd.gauss(0.001, 0.015)))
+            out.append(dict(date=day.isoformat(), open=o, high=max(o, c) * (1 + abs(rnd.gauss(0, 0.006))),
+                            low=min(o, c) * (1 - abs(rnd.gauss(0, 0.006))), close=c, volume=int(vol * (0.5 + rnd.random())),
+                            raw_close=c * adjf))
+        day += dt.timedelta(days=1)
+    return out
+
+
+def ref_chart_decode(s):
+    """照規格寫的參考解碼器（獨立於 HTML_JS 的 chDec）"""
+    assert re.fullmatch(r'[A-Za-z]+', s)
+    p = [0]
+
+    def u():
+        v = 0
+        while True:
+            c = ord(s[p[0]])
+            p[0] += 1
+            if c < 91:
+                v = v * 26 + c - 65
+            else:
+                return v * 26 + c - 97
+
+    def z():
+        v = u()
+        return -(v + 1) // 2 if v % 2 else v // 2
+
+    def grp(n):
+        k = u()
+        a = [None] * k
+        if k < n:
+            x = u()
+            a.append(x)
+            for _ in range(n - k - 1):
+                x += z()
+                a.append(x)
+        return a
+
+    def run(n):
+        x = z()
+        a = [x]
+        for _ in range(n - 1):
+            x += z()
+            a.append(x)
+        return a
+    o = {}
+    assert u() == 1
+    n = o['n'] = u()
+    o['e'] = u() - 2
+    o['mo'], o['dy'] = u(), u()
+    o['tk'] = [(u(), u()) for _ in range(u())]
+    c = [u()]
+    for _ in range(n - 1):
+        c.append(c[-1] + z())
+    op = [x + z() for x in c]
+    h = [max(a, b) + u() for a, b in zip(op, c)]
+    lo_ = [min(a, b) - u() for a, b in zip(op, c)]
+    m20, m60, bw = grp(n), grp(n), grp(n)
+    v = [u() for _ in range(n)]
+    mv = grp(n)
+    o['me'] = u() - 10
+    dif, osc = run(n), run(n)
+    b = u()
+    o.update(c=c, o=op, h=h, l=lo_, m20=m20, m60=m60, bw=bw, v=v, mv=mv, dif=dif, osc=osc, wk=(b & 1, b >> 1 & 1, b >> 2 & 1, z(), z()))
+    assert p[0] == len(s)
+    return o
+
+
+class TestChart(unittest.TestCase):
+    def test_t1_series_matches_analyze(self):
+        import copy
+        for n in (80, 119, 120, 121, 200, 260):
+            for seed in range(6):
+                for adjf in (1, 0.8):
+                    bars = rw_bars(n, seed, adjf)
+                    before = copy.deepcopy(bars)
+                    r0 = screener.analyze('1234', 'x', bars)
+                    s = screener.chart_series(bars)
+                    r = screener.analyze('1234', 'x', bars)
+                    tag = (n, seed, adjf)
+                    self.assertEqual(bars, before, tag)
+                    self.assertEqual(r, r0, tag)
+                    self.assertEqual(len(s['c']), min(n, 120), tag)
+                    self.assertEqual(round(s['c'][-1], 2), r['close'], tag)
+                    for k, kk in (('ma20', 'ma20'), ('ma60', 'ma60'), ('up', 'boll_up'), ('lo', 'boll_lo')):
+                        self.assertEqual(round(s[k][-1], 2), r['ma'][kk], (tag, k))
+                    self.assertEqual([round(s['osc'][-2], 2), round(s['osc'][-1], 2)], r['osc'], tag)
+                    self.assertEqual(round(s['wk'][0], 2), r['week']['dif'], tag)
+                    self.assertEqual(round(s['wk'][1], 2), r['week']['osc'], tag)
+                    self.assertEqual(s['date'][-1], bars[-1]['date'])
+
+    def test_t2_roundtrip(self):
+        import math
+        for seed in range(8):
+            for n, base in ((120, 50.0), (80, 800.0), (150, 3.5)):
+                bars = rw_bars(n, seed, 0.9, base=base)
+                s = screener.chart_series(bars)
+                code = screener.chart_code(s)
+                self.assertRegex(code, r'^[A-Za-z]{8,8000}$')
+                d = ref_chart_decode(code)
+                N = len(s['c'])
+                self.assertEqual(d['n'], N)
+                e = max(-2, math.floor(math.log10(max(s['h']))) - 3)
+                step = 10.0 ** e
+                q = (lambda x: round(x * 10 ** -e)) if e < 0 else (lambda x: round(x / 10 ** e))
+                self.assertEqual(d['e'], e)
+                self.assertEqual(d['c'], [q(x) for x in s['c']])
+                self.assertEqual(d['o'], [q(x) for x in s['o']])
+                self.assertEqual(d['h'], [q(x) for x in s['h']])
+                self.assertEqual(d['l'], [q(x) for x in s['l']])
+                for i in range(N):
+                    self.assertGreaterEqual(d['h'][i], max(d['o'][i], d['c'][i]))
+                    self.assertGreaterEqual(min(d['o'][i], d['c'][i]), d['l'][i])
+                    for k, kk in (('c', 'c'), ('o', 'o'), ('h', 'h'), ('l', 'l')):
+                        self.assertLessEqual(abs(d[kk][i] * step - s[k][i]), step / 2 + 1e-9)
+                    for k, kk in (('ma20', 'm20'), ('ma60', 'm60')):
+                        if s[k][i] is None:
+                            self.assertIsNone(d[kk][i])
+                        else:
+                            self.assertLessEqual(abs(d[kk][i] * step - s[k][i]), step / 2 + 1e-9)
+                    if s['up'][i] is not None:
+                        self.assertLessEqual(abs((d['m20'][i] + d['bw'][i]) * step - s['up'][i]), step + 1e-9)
+                        self.assertLessEqual(abs((d['m20'][i] - d['bw'][i]) * step - s['lo'][i]), step + 1e-9)
+                    ms = 10.0 ** d['me']
+                    self.assertLessEqual(abs(d['dif'][i] * ms - s['dif'][i]), ms / 2 + 1e-9)
+                    if s['osc'][i] != 0:
+                        self.assertEqual(d['osc'][i] > 0, s['osc'][i] > 0, (seed, n, i))
+                        self.assertNotEqual(d['osc'][i], 0)
+                    self.assertTrue(0 <= d['v'][i] <= 675)
+                self.assertEqual((d['mo'], d['dy']), (int(s['date'][-1][5:7]), int(s['date'][-1][8:10])))
+                self.assertEqual(d['wk'][3], round(s['wk'][0] * 100))
+                self.assertEqual(bool(d['wk'][2]), bool(s['wk'][2]))
+
+    def test_t3_edges(self):
+        import math
+        d = ref_chart_decode(screener.chart_code(screener.chart_series(rw_bars(80, 1))))
+        self.assertEqual(d['n'], 80)
+        self.assertEqual(d['m60'].count(None), 59)
+        self.assertEqual(d['m20'].count(None), 19)
+        self.assertEqual(d['bw'].count(None), 19)
+        self.assertEqual(d['mv'].count(None), 4)
+        flat = [dict(date=b['date'], open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, raw_close=10.0) for b in rw_bars(100, 1)]
+        d = ref_chart_decode(screener.chart_code(screener.chart_series(flat)))
+        self.assertEqual(d['me'], -10)
+        self.assertEqual(set(d['osc']), {0})
+        for base in (0.5, 25000.0):
+            s = screener.chart_series(rw_bars(90, 2, 1, base=base))
+            d = ref_chart_decode(screener.chart_code(s))
+            self.assertEqual(d['e'], max(-2, math.floor(math.log10(max(s['h']))) - 3))
+            self.assertEqual(len(s['c']), 90)
+        bars = rw_bars(100, 3)
+        bars[50]['close'] = float('nan')
+        with self.assertRaises(ValueError):
+            screener.chart_code(screener.chart_series(bars))
+        s = screener.chart_series(rw_bars(100, 3))
+        s['l'][3] = 0.0
+        with self.assertRaises(ValueError):
+            screener.chart_code(s)
+        s = screener.chart_series(rw_bars(100, 3))
+        with mock.patch.object(screener, 'CHART_MAX', 100):
+            with self.assertRaises(ValueError):
+                screener.chart_code(s)
+
+    def _codes(self):
+        return {'1101': screener.chart_code(screener.chart_series(rw_bars(150, 1))),
+                '2454': screener.chart_code(screener.chart_series(rw_bars(150, 2)))}
+
+    def test_t4_render_html(self):
+        res = fake_results()
+        codes = self._codes()
+        h0 = screener.render_html(res, False, meta_for())
+        h = screener.render_html(res, False, meta_for(charts=codes))
+        self.assertEqual(h0, screener.render_html(res, False, meta_for(charts={})))
+        self.assertEqual(h.count(' data-ch="'), 2)
+        self.assertIn('data-mkt="" data-ch="%s">' % codes['1101'], h)
+        self.assertRegex(h, r'<tbody class="cand" [^>]*data-code="1101"[^>]* data-ch="[A-Za-z]+"><tr class="r1">')
+        self.assertRegex(h, r'<tr data-i="0" data-code="2454"[^>]* data-ch="[A-Za-z]+"><th')
+        self.assertEqual(h.count('<script'), 3)
+        self.assertEqual(h0.count('<script'), 3)
+        self.assertEqual(re.sub(r' data-ch="[A-Za-z]+"', '', h), h0)
+        self.assertNotIn('<svg', re.sub(r'<script>.*?</script>', '', h, flags=re.S))      # 靜態 HTML 沒有 svg，只有程式碼裡的字串
+
+    def test_t5_scan(self):
+        data = os.path.join(self._td_path(), 'data')
+        make_data(data, ('1101', '2330', '2454'))
+        real = screener.analyze
+
+        def fake(code, name, bars):
+            r = real(code, name, bars)
+            if code == '2330':
+                r.update(type='回測型', stop=round(r['close'] * 0.95, 2), setup='測試', stop_why='測試', watch=True)
+            elif code == '2454':
+                r.update(watch=True)
+                r.pop('type', None)
+            else:
+                r.update(watch=False)
+                r.pop('type', None)
+            return r
+
+        def run(tag, raiser=False):
+            out = os.path.join(self._td_path(), tag)
+            a = argparse.Namespace(data=data, config=None, list=None, capital=1000000, risk=None, out=None, json=None, txt=None,
+                                   html=None, csv=None, out_dir=out, open=False, share=False)
+            with mock.patch.object(screener, 'analyze', fake):
+                if raiser:
+                    with mock.patch.object(screener, 'chart_code', side_effect=ValueError('x')):
+                        quiet(screener.cmd_scan, a)
+                else:
+                    quiet(screener.cmd_scan, a)
+            return {e: readb(os.path.join(out, [n for n in os.listdir(out) if n.endswith('.' + e)][0])) for e in ('html', 'md', 'txt', 'json', 'csv')}
+        a, b = run('a'), run('b', True)
+        ha = a['html'].decode('utf-8')
+        self.assertEqual(ha.count(' data-ch="'), 2)
+        self.assertRegex(ha, r'data-code="2330"[^>]* data-ch="')
+        self.assertRegex(ha, r'data-code="2454"[^>]* data-ch="')
+        self.assertNotIn(' data-ch="', b['html'].decode('utf-8'))
+        for e in ('md', 'txt', 'json', 'csv'):
+            self.assertEqual(a[e], b[e], e)
+
+    def _td_path(self):
+        if not hasattr(self, '_tdo'):
+            self._tdo = tempfile.TemporaryDirectory(prefix='線圖 (x86) ')
+            self.addCleanup(self._tdo.cleanup)
+        return self._tdo.name
+
+    def test_t6_js_static(self):
+        js = screener.HTML_JS
+        for bad in ('=>', '`', 'createElementNS', 'xmlns', 'http', 'src=', '@', 'data:'):
+            self.assertNotIn(bad, js, bad)
+        self.assertNotRegex(js, r'(?m)^[^/\n]*[^:\s/][ \t]*//')       # 沒有行尾註解
+        self.assertNotRegex(js, r'\b(?:let|const|class)\s')
+        sj = screener.SHARE_JS
+        self.assertIn('chDec', sj)
+        self.assertIn('Escape', sj)
+        self.assertNotIn('wt', sj)
+        self.assertNotRegex(sj, r'[0-9]{5}')
+        self.assertNotRegex(sj, r'[0-9],[0-9]{3}')
+        self.assertNotRegex(sj, r'(?<![A-Za-z0-9_-])lh(?![A-Za-z0-9_-])')
+        self.assertNotRegex(sj, r'[0-9]e\+?[0-9]')
+        for k in screener.CONFIG_KEYS:
+            self.assertNotRegex(sj, r'(?<![A-Za-z0-9_-])' + k + r'\s*=')
+        self.assertNotIn('<!--', sj)
+        self.assertNotIn('</script', sj)
+        for w in ('部位', '總資金', '風險', '自選股', '觀察名單', '試算'):
+            self.assertNotIn(w, sj)
+        self.assertNotRegex(screener.HTML_CSS, r'(?<![A-Za-z-])lh(?![A-Za-z-])|data:|url\(|transition|animation')
+
+    def test_t7_chart_colors_contrast(self):
+        css = screener.HTML_CSS
+        toks = set()
+        for m in re.finditer(r'\.cx-[a-z0-9]+(?:,\.cx-[a-z0-9]+)*\{([^}]*)\}', css):
+            toks |= set(re.findall(r'(?:fill|stroke):var\(--([a-z0-9-]+)\)', m.group(1)))
+        toks -= {'hairline', 'card'}
+        self.assertTrue({'up', 'down', 'ink', 'ink2', 'link', 'cap', 'warn'} <= toks, toks)
+        for name in ('light', 'dark'):
+            p = screener.PALETTE[name]
+            for t in toks:
+                for bg in ('page', 'surface'):
+                    self.assertGreaterEqual(wcag_ratio(p[t.replace('-', '_')], p[bg]), 4.5, (name, t, bg))
+
+    def test_t8_length(self):
+        lens = []
+        for seed in range(20):
+            lens.append(len(screener.chart_code(screener.chart_series(rw_bars(120, seed, 0.95, base=20 + seed * 15)))))
+        avg = sum(lens) / len(lens)
+        print('\n[T8] data-ch 平均長度 %.0f（最大 %d）' % (avg, max(lens)))
+        self.assertLessEqual(avg, 2600)
+        self.assertLess(max(lens), screener.CHART_MAX)
 
 
 if __name__ == '__main__':
