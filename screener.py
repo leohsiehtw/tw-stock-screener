@@ -667,7 +667,7 @@ def chart_code(s):
     o, h, l, c = ([q(x) for x in s[k]] for k in ('o', 'h', 'l', 'c'))
     d = s['date']
     ticks = [(i, int(d[i][5:7])) for i in range(1, n) if d[i][5:7] != d[i - 1][5:7]]
-    out = [_vi(1), _vi(n), _vi(e + 2), _vi(int(d[-1][5:7])), _vi(int(d[-1][8:10])), _vi(len(ticks))]
+    out = [_vi(2), _vi(n), _vi(e + 2), _vi(int(d[-1][5:7])), _vi(int(d[-1][8:10])), _vi(len(ticks))]
     out += [_vi(i) + _vi(m) for i, m in ticks]
     out += [_vi(c[0]), ''.join(_zz(y - x) for x, y in zip(c, c[1:]))]
     out.append(''.join(_zz(a - b) for a, b in zip(o, c)))
@@ -688,6 +688,17 @@ def chart_code(s):
     out.append(run([qm(x) or (x > 0) - (x < 0) for x in s['osc']]))       # 非 0 卻量化成 0：留下正負號
     wd, wo, flip = s['wk']
     out.append(_vi((wd > 0) + 2 * (wo > 0) + 4 * bool(flip)) + _zz(round(wd * 100)) + _zz(round(wo * 100)))
+    # 第 2 版加在最後：最後一天的年（減 2000）、最大量（張）、每兩個「相鄰兩根差幾天減 1」併成一個字母（都小於 5 才併，否則 z 加兩個值）
+    try:
+        dd = [dt.date.fromisoformat(x) for x in d]
+    except (TypeError, ValueError):
+        raise ValueError('線圖：日期不合理') from None
+    g = [(y - x).days - 1 for x, y in zip(dd, dd[1:])]
+    if any(x < 0 for x in g) or not 2000 <= dd[-1].year < 2100:
+        raise ValueError('線圖：日期不合理')
+    g += [0] * (len(g) % 2)
+    out.append(_vi(dd[-1].year - 2000) + _vi(round(vmax / 1000)))
+    out.extend(_vi(a * 5 + b) if a < 5 and b < 5 else _vi(25) + _vi(a) + _vi(b) for a, b in zip(g[::2], g[1::2]))
     code = ''.join(out)
     if len(code) > CHART_MAX:
         raise ValueError('線圖：資料太長')
@@ -755,7 +766,7 @@ def push_text(res, list_mode):
     ok = [r for r in res if 'error' not in r]
     date = max((r['date'] for r in ok), default='')
     cands = [r for r in ok if r.get('type')]
-    out = [f'📈 盤後選股 {date}', '']
+    out = [f'盤後選股 {date}', '']
     if not cands:
         out.append('今天沒有符合條件的標的。')
     for r in cands:
@@ -896,23 +907,29 @@ th[aria-sort] .sb{color:var(--ink)}
 .chp{margin-top:12px}
 .chp svg{display:block;width:100%;height:auto}
 .chk{display:flex;flex-wrap:wrap;gap:4px 16px;margin:8px 0 0;padding:0;list-style:none;font-size:12px;line-height:16px;color:var(--ink2)}
-.chk li::before{content:"";display:inline-block;width:16px;margin-right:4px;vertical-align:middle;border-top:2px var(--ks,solid) var(--kc,var(--ink2))}
-.chk .lg-bar::before{--kc:var(--up);border-top-width:8px}
-.chk .lg-m20::before,.chk .lg-dif::before{--kc:var(--link)}
-.chk .lg-m60::before{--kc:var(--cap);--ks:dashed}
-.chk .lg-dea::before{--kc:var(--cap);--ks:dashed}
-.chk .lg-bb::before{--ks:dotted}
-.chk .lg-stop::before{--kc:var(--warn);--ks:dashed}
-.chk .lg-dot::before{--kc:var(--ink);width:8px;height:8px;border:0;border-radius:50%;background:var(--ink)}
-.chk .lg-mv::before{--kc:var(--ink)}
-.chk .lg-osc::before{--kc:var(--down);border-top-width:8px}
+.chk li{display:flex;align-items:center}
+.chk svg{width:24px;height:10px;margin-right:4px;overflow:visible}
+.chz,.chi{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:8px 0}
+.chi>span,.chg{font-size:12px;line-height:16px;color:var(--ink2)}
+.chi>span{min-width:28px}
+.chp .chip{font-size:13px;padding:6px 12px;min-height:34px}
+.chp .chip:disabled{opacity:.5;cursor:default}
+.cho{margin:4px 0;font-size:12px;line-height:16px;color:var(--ink);font-variant-numeric:tabular-nums;white-space:pre-wrap;overflow-wrap:anywhere}
+.chq{touch-action:pan-y;-webkit-user-select:none;user-select:none;cursor:crosshair;border-radius:8px}
+.chs+.chs{border-top:1px solid var(--hairline)}
+.chh{display:flex;align-items:center;gap:6px;min-height:28px;font-size:12px;line-height:16px;color:var(--ink2)}
+.chn{flex:none;color:var(--ink);font-weight:600;border:1px solid var(--ink3);border-radius:6px;padding:0 6px}
+.chv{flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.chx{flex:none;touch-action:manipulation;font:inherit;font-size:16px;line-height:16px;color:var(--ink);background:none;min-width:32px;min-height:28px;border:1px solid var(--ink3);border-radius:8px;cursor:pointer}
+.chx:hover{border-color:var(--ink)}
+@media (max-width:734px){.chp .chip,.chx{min-height:44px;min-width:44px}}
 .chw{margin-top:8px;font-size:12px;line-height:16px;color:var(--ink2)}
 .chp .chb{margin-top:8px}
 .ct .r3 td{padding-top:0}
 .cx-up{fill:var(--up)}
 .cx-dn{fill:var(--down)}
 .cx-fl{fill:var(--ink2)}
-.cx-wu,.cx-wd,.cx-wf,.cx-ma20,.cx-ma60,.cx-bb,.cx-stop,.cx-mv5,.cx-dif,.cx-dea,.cx-grid{fill:none}
+.cx-wu,.cx-wd,.cx-wf,.cx-ma5,.cx-ma10,.cx-ma20,.cx-ma60,.cx-bb,.cx-stop,.cx-mv5,.cx-dif,.cx-dea,.cx-k,.cx-d,.cx-gd,.cx-x,.cx-grid{fill:none}
 .cx-wu{stroke:var(--up)}
 .cx-wd{stroke:var(--down)}
 .cx-wf{stroke:var(--ink2)}
@@ -924,6 +941,12 @@ th[aria-sort] .sb{color:var(--ink)}
 .cx-dif{stroke:var(--link);stroke-width:1.5}
 .cx-dea{stroke:var(--cap);stroke-width:1.5;stroke-dasharray:4 3}
 .cx-grid{stroke:var(--hairline);stroke-width:1}
+.cx-ma5{stroke:var(--warn);stroke-width:1}
+.cx-ma10{stroke:var(--ink);stroke-width:1.25;stroke-dasharray:8 2 2 2}
+.cx-k{stroke:var(--link);stroke-width:1.5}
+.cx-d{stroke:var(--cap);stroke-width:1.5;stroke-dasharray:4 3}
+.cx-gd{stroke:var(--ink3);stroke-width:1;stroke-dasharray:3 3}
+.cx-x{stroke:var(--ink);stroke-width:1;stroke-dasharray:3 2}
 .cx-cl{fill:var(--ink);stroke:var(--card);stroke-width:2}
 .cx-t,.cx-tb,.cx-ts{font-size:11px}
 .cx-t{fill:var(--ink2)}
@@ -1092,7 +1115,70 @@ HTML_JS = r'''
   }
 
   // 線圖：每列的 data-ch 是一串英文字母（欄位順序見 screener.py 的 chart_code），第一次打開才解碼、才畫
-  var chN = 0, chAll = [], chTimer = 0;
+  // 指標可以選（所有圖共用，記在 twss-ind）；可以縮放、平移；十字線讀數。MA5、MA10、KD、RSI 由頁面用解碼後的價格算（約略值）
+  var chN = 0, chAll = [], chTimer = 0, CH_K = 'twss-ind';
+  var CH_MAIN = ['ma5', 'ma10', 'ma20', 'ma60', 'bb'], CH_SUB = ['vol', 'kd', 'macd', 'rsi'];
+  var CH_NM = { ma5: 'MA5', ma10: 'MA10', ma20: 'MA20', ma60: 'MA60', bb: '布林', vol: '成交量', kd: 'KD', macd: 'MACD', rsi: 'RSI' };
+  var chOn = { ma20: true, ma60: true, bb: true, vol: true, macd: true };
+  (function () {
+    var v = null;
+    try { v = localStorage.getItem(CH_K); } catch (e) { }
+    if (typeof v === 'string' && /^[a-z0-9,]*$/.test(v)) {
+      chOn = {};
+      v.split(',').forEach(function (k) { if (CH_NM.hasOwnProperty(k)) { chOn[k] = true; } });
+    }
+  })();
+  function chSave() {
+    var v = CH_MAIN.concat(CH_SUB).filter(function (k) { return chOn[k]; }).join(',');
+    try { localStorage.setItem(CH_K, v); } catch (e) { }
+  }
+  function chSma(a, n) {
+    var r = [], s = 0, i;
+    for (i = 0; i < a.length; i++) {
+      s += a[i];
+      if (i >= n) { s -= a[i - n]; }
+      r.push(i >= n - 1 ? s / n : null);
+    }
+    return r;
+  }
+  // KD(9,3,3)：RSV = (收 - 9 日最低) / (9 日最高 - 9 日最低) × 100（最高等於最低時當 50）；K、D 從 50 起算，各取 1/3 新值；前 w 根不畫
+  function chKD(h, l, c, w) {
+    var K = [], D = [], k = 50, q = 50, i, j, hh, ll, rv;
+    for (i = 0; i < c.length; i++) {
+      if (i < 8) { K.push(null); D.push(null); continue; }
+      hh = -Infinity; ll = Infinity;
+      for (j = i - 8; j <= i; j++) { if (h[j] > hh) { hh = h[j]; } if (l[j] < ll) { ll = l[j]; } }
+      rv = hh > ll ? (c[i] - ll) / (hh - ll) * 100 : 50;
+      k = k * 2 / 3 + rv / 3; q = q * 2 / 3 + k / 3;
+      K.push(i < w ? null : k); D.push(i < w ? null : q);
+    }
+    return [K, D];
+  }
+  // RSI（Wilder）：前 n 個漲跌的平均當起點，之後 (舊 × (n - 1) + 新) / n；漲跌都是 0 時當 50；前 w 根不畫
+  function chRSI(c, n, w) {
+    var r = [], g = 0, s = 0, i, x;
+    for (i = 0; i < c.length; i++) {
+      x = i ? c[i] - c[i - 1] : 0;
+      if (i <= n) {
+        if (x > 0) { g += x; } else { s -= x; }
+        if (i === n) { g /= n; s /= n; }
+      } else {
+        g = (g * (n - 1) + Math.max(x, 0)) / n; s = (s * (n - 1) + Math.max(-x, 0)) / n;
+      }
+      r.push(i < n || i < w ? null : (g + s > 0 ? g / (g + s) * 100 : 50));
+    }
+    return r;
+  }
+  // 可見範圍：從第 a 根開始共 m 根；最少 20 根（不到 20 根就全部），不超出資料
+  function chWin(n, a, m) {
+    m = Math.max(Math.min(n, 20), Math.min(n, Math.round(m)));
+    return [Math.max(0, Math.min(n - m, Math.round(a))), m];
+  }
+  // 縮放：根數乘 f，畫面上位置 t（0 是左邊、1 是右邊）的那根留在原處
+  function chZoom(n, a, m, f, t) {
+    var m2 = chWin(n, 0, m * f)[1];
+    return chWin(n, a + t * (m - m2), m2);
+  }
   function chDec(s) {
     if (!/^[A-Za-z]+$/.test(s || '')) { return null; }
     var p = 0, bad = false, o = {}, n, t, j, ver, b;
@@ -1124,13 +1210,13 @@ HTML_JS = r'''
       return a;
     }
     ver = u(); n = u(); o.n = n; o.e = u() - 2;
-    if (bad || ver !== 1 || n < 2 || n > 400) { return null; }
+    if (bad || ver !== 2 || n < 2 || n > 400) { return null; }
     o.mo = u(); o.dy = u();
     t = u();
     if (t > 40) { return null; }
     o.tk = [];
     for (j = 0; j < t; j++) { o.tk.push([u(), u()]); }
-    o.c = []; o.op = []; o.h = []; o.l = []; o.up = []; o.lo = []; o.v = []; o.dea = [];
+    o.c = []; o.op = []; o.h = []; o.l = []; o.up = []; o.lo = []; o.v = []; o.dea = []; o.gd = []; o.off = [];
     o.c.push(u());
     for (j = 1; j < n; j++) { o.c.push(o.c[j - 1] + z()); }
     for (j = 0; j < n; j++) { o.op.push(o.c[j] + z()); }
@@ -1143,110 +1229,434 @@ HTML_JS = r'''
     }
     for (j = 0; j < n; j++) { o.v.push(u()); }
     o.mv = grp(n);
-    u();
+    o.me = u() - 10;
     o.dif = run(n); o.osc = run(n);
     for (j = 0; j < n; j++) { o.dea.push(o.dif[j] - o.osc[j]); }
     b = u();
     o.wk = [b % 2 === 1, Math.floor(b / 2) % 2 === 1, Math.floor(b / 4) % 2 === 1, z() / 100, z() / 100];
+    o.yr = 2000 + u(); o.vk = u();
+    for (j = 0; j < n - 1; j += 2) {
+      t = u();
+      if (t === 25) { o.gd.push(u(), u()); } else { o.gd.push(Math.floor(t / 5), t % 5); }
+    }
     if (bad || p !== s.length) { return null; }
+    o.off[n - 1] = 0;
+    for (j = n - 2; j >= 0; j--) { o.off[j] = o.off[j + 1] + o.gd[j] + 1; }
+    o.m5 = chSma(o.c, 5); o.m10 = chSma(o.c, 10);
+    b = chKD(o.h, o.l, o.c, 22); o.k = b[0]; o.kd = b[1];
+    o.r5 = chRSI(o.c, 5, 25); o.r10 = chRSI(o.c, 10, 40);
     return o;
   }
-  function chSvg(o, w, stop, close, id) {
-    var n = o.n, st = Math.pow(10, o.e), dec = Math.max(0, -o.e), i, k;
-    var small = w < 520, hp = small ? 160 : 220, hv = small ? 44 : 56, hm = small ? 56 : 72, ty = 8;
-    var x0 = 4, x1 = w - 56, slot = (x1 - x0) / n, bw = Math.max(1, slot * 0.66);
-    var yv = ty + hp + 10, ym = yv + hv + 10, ht = ym + hm + 20;
-    var lo = Infinity, hi = -Infinity;
-    function r1(x) { return Math.round(x * 10) / 10; }
-    function px(j) { return x0 + (j + 0.5) * slot; }
-    function ext(a) {
-      for (var j = 0; j < a.length; j++) {
-        if (a[j] !== null) { if (a[j] < lo) { lo = a[j]; } if (a[j] > hi) { hi = a[j]; } }
-      }
+  function r1(x) { return Math.round(x * 10) / 10; }
+  function chP(cls, dd) { return dd ? '<path class="' + cls + '" d="' + dd + '"/>' : ''; }
+  function chT(cls, x, y, an, s) {
+    return '<text class="' + cls + '" x="' + r1(x) + '" y="' + r1(y) + '" text-anchor="' + an + '">' + s + '</text>';
+  }
+  function chX(g, j) { return g.x0 + (j - g.a + 0.5) * g.slot; }
+  function chLine(g, a, f) {
+    var s = '', on = false, j;
+    for (j = g.a; j < g.a + g.m; j++) {
+      if (a[j] !== null) { s += (on ? 'L' : 'M') + r1(chX(g, j)) + ' ' + r1(f(a[j])); on = true; }
     }
-    var sv = stop === null ? null : stop / st, cv = close === null ? o.c[n - 1] : close / st;
-    ext(o.l); ext(o.h); ext(o.m20); ext(o.m60); ext(o.up); ext(o.lo); ext([cv]);
-    if (sv !== null) { ext([sv]); }
+    return s;
+  }
+  function p2(v) { return (v < 10 ? '0' : '') + v; }
+  function chDate(o, i) {
+    var x = new Date(o.yr, o.mo - 1, o.dy - o.off[i]);
+    return p2(x.getMonth() + 1) + '/' + p2(x.getDate());
+  }
+  function chBar(g, x, y, hh) { return 'M' + r1(x - g.bw / 2) + ' ' + r1(y) + 'h' + r1(g.bw) + 'v' + r1(Math.max(1, hh)) + 'h' + r1(-g.bw) + 'z'; }
+  function chCls(o, i) { return o.c[i] > o.op[i] ? 'u' : (o.c[i] < o.op[i] ? 'd' : 'f'); }
+  function chMain(c, g) {
+    var o = c.o, n = o.n, a = g.a, b = a + g.m, st = Math.pow(10, o.e), dec = Math.max(0, -o.e), i, k, x;
+    var hp = g.small ? 160 : 220, ty = 8, lo = Infinity, hi = -Infinity, last = b === n, ht = ty + hp + 20;
+    function one(v) { if (v !== null) { if (v < lo) { lo = v; } if (v > hi) { hi = v; } } }
+    function ext(arr) { for (var j = a; j < b; j++) { one(arr[j]); } }
+    var sv = c.stop === null ? null : c.stop / st, cv = c.close === null ? o.c[n - 1] : c.close / st;
+    ext(o.l); ext(o.h);
+    if (chOn.ma5) { ext(o.m5); }
+    if (chOn.ma10) { ext(o.m10); }
+    if (chOn.ma20) { ext(o.m20); }
+    if (chOn.ma60) { ext(o.m60); }
+    if (chOn.bb) { ext(o.up); ext(o.lo); }
+    if (last) { one(cv); one(sv); }
     var pad = (hi - lo) * 0.05 || 1;
     lo -= pad; hi += pad;
-    function py(x) { return ty + (hi - x) / (hi - lo) * hp; }
-    function line(a, f) {
-      var s = '', on = false, j;
-      for (j = 0; j < a.length; j++) {
-        if (a[j] !== null) { s += (on ? 'L' : 'M') + r1(px(j)) + ' ' + r1(f(a[j])); on = true; }
-      }
-      return s;
-    }
-    function pth(cls, dd) { return dd ? '<path class="' + cls + '" d="' + dd + '"/>' : ''; }
-    function txt(cls, x, y, an, s) {
-      return '<text class="' + cls + '" x="' + r1(x) + '" y="' + r1(y) + '" text-anchor="' + an + '">' + s + '</text>';
-    }
-    var wk = { u: '', d: '', f: '' }, bd = { u: '', d: '', f: '' }, vb = { u: '', d: '', f: '' };
-    var vm = 1, vy0 = yv + hv, ob = { u: '', d: '' };
-    for (i = 0; i < n; i++) { if (o.v[i] > vm) { vm = o.v[i]; } if (o.mv[i] !== null && o.mv[i] > vm) { vm = o.mv[i]; } }
-    var mm = 1;
-    for (i = 0; i < n; i++) { mm = Math.max(mm, Math.abs(o.dif[i]), Math.abs(o.dea[i]), Math.abs(o.osc[i])); }
-    var yz = ym + hm / 2;
-    function vy(x) { return vy0 - x / vm * hv; }
-    function my(x) { return yz - x / mm * (hm / 2 - 2); }
-    for (i = 0; i < n; i++) {
-      k = o.c[i] > o.op[i] ? 'u' : (o.c[i] < o.op[i] ? 'd' : 'f');
-      var x = px(i), ya = py(Math.max(o.op[i], o.c[i])), yb = py(Math.min(o.op[i], o.c[i]));
+    if (sv !== null && (sv < lo || sv > hi)) { sv = null; }
+    function py(v) { return ty + (hi - v) / (hi - lo) * hp; }
+    var wk = { u: '', d: '', f: '' }, bd = { u: '', d: '', f: '' };
+    for (i = a; i < b; i++) {
+      k = chCls(o, i); x = chX(g, i);
+      var ya = py(Math.max(o.op[i], o.c[i])), yb = py(Math.min(o.op[i], o.c[i]));
       wk[k] += 'M' + r1(x) + ' ' + r1(py(o.h[i])) + 'V' + r1(py(o.l[i]));
-      bd[k] += 'M' + r1(x - bw / 2) + ' ' + r1(ya) + 'h' + r1(bw) + 'v' + r1(Math.max(1, yb - ya)) + 'h' + r1(-bw) + 'z';
-      vb[k] += 'M' + r1(x - bw / 2) + ' ' + r1(vy(o.v[i])) + 'h' + r1(bw) + 'V' + r1(vy0) + 'h' + r1(-bw) + 'z';
-      if (o.osc[i] !== 0) {
-        var y1 = my(o.osc[i]), y2 = Math.min(y1, yz), hh = Math.max(1, Math.abs(y1 - yz));
-        ob[o.osc[i] > 0 ? 'u' : 'd'] += 'M' + r1(x - bw / 2) + ' ' + r1(y2) + 'h' + r1(bw) + 'v' + r1(hh) + 'h' + r1(-bw) + 'z';
-      }
+      bd[k] += chBar(g, x, ya, yb - ya);
     }
     var yc = py(cv), ys = sv === null ? -99 : py(sv), cl = yc, sl = ys;
-    if (sv !== null && Math.abs(yc - ys) < 13) { if (ys >= yc) { sl = yc + 13; } else { cl = ys + 13; } }
+    if (sv !== null && last && Math.abs(yc - ys) < 13) { if (ys >= yc) { sl = yc + 13; } else { cl = ys + 13; } }
+    if (!last) { cl = -99; }
     var grid = '', labs = '', f, gy;
     for (i = 0; i < 3; i++) {
       f = [0.1, 0.5, 0.9][i];
       gy = py(lo + (hi - lo) * f);
-      grid += 'M' + x0 + ' ' + r1(gy) + 'H' + r1(x1);
-      if (Math.abs(gy - cl) > 9 && Math.abs(gy - sl) > 9) { labs += txt('cx-t', x1 + 4, gy + 4, 'start', ((lo + (hi - lo) * f) * st).toFixed(dec)); }
+      grid += 'M' + g.x0 + ' ' + r1(gy) + 'H' + r1(g.x1);
+      if (Math.abs(gy - cl) > 9 && Math.abs(gy - sl) > 9) { labs += chT('cx-t', g.x1 + 4, gy + 4, 'start', ((lo + (hi - lo) * f) * st).toFixed(dec)); }
     }
-    var out = '<svg viewBox="0 0 ' + w + ' ' + Math.round(ht) + '" role="img" aria-labelledby="cht-' + id + ' chd-' + id + '">';
-    out += '<title id="cht-' + id + '"></title><desc id="chd-' + id + '"></desc>';
-    out += pth('cx-grid', grid + 'M' + x0 + ' ' + r1(vy0) + 'H' + r1(x1) + 'M' + x0 + ' ' + r1(yz) + 'H' + r1(x1));
-    out += pth('cx-bb', line(o.up, py) + line(o.lo, py));
-    out += '<g class="cg-p">' + pth('cx-wu', wk.u) + pth('cx-wd', wk.d) + pth('cx-wf', wk.f);
-    out += pth('cx-up', bd.u) + pth('cx-dn', bd.d) + pth('cx-fl', bd.f) + '</g>';
-    out += pth('cx-ma60', line(o.m60, py)) + pth('cx-ma20', line(o.m20, py));
-    if (sv !== null) { out += pth('cx-stop', 'M' + x0 + ' ' + r1(ys) + 'H' + r1(x1)); }
-    out += '<circle class="cx-cl" cx="' + r1(px(n - 1)) + '" cy="' + r1(yc) + '" r="3.5"/>';
-    out += labs + txt('cx-tb', x1 + 4, cl + 4, 'start', '收 ' + (close === null ? (o.c[n - 1] * st).toFixed(dec) : close));
-    if (sv !== null) { out += txt('cx-ts', x1 + 4, sl + 4, 'start', '停損 ' + stop); }
-    out += '<g class="cg-v">' + pth('cx-up', vb.u) + pth('cx-dn', vb.d) + pth('cx-fl', vb.f) + '</g>' + pth('cx-mv5', line(o.mv, vy));
-    out += txt('cx-t', x1 + 4, yv + 10, 'start', '量') + txt('cx-t', x1 + 4, ym + 10, 'start', 'MACD');
-    out += '<g class="cg-m">' + pth('cx-up', ob.u) + pth('cx-dn', ob.d) + '</g>' + pth('cx-dea', line(o.dea, my)) + pth('cx-dif', line(o.dif, my));
-    var prev = -99, yd = ym + hm + 14, lc = x1 - 15, t, xx;
+    var out = '<svg viewBox="0 0 ' + g.w + ' ' + ht + '" role="img" aria-labelledby="cht-' + c.id + ' chd-' + c.id + '">';
+    out += '<title id="cht-' + c.id + '"></title><desc id="chd-' + c.id + '"></desc>';
+    out += chP('cx-grid', grid);
+    if (chOn.bb) { out += chP('cx-bb', chLine(g, o.up, py) + chLine(g, o.lo, py)); }
+    out += '<g class="cg-p">' + chP('cx-wu', wk.u) + chP('cx-wd', wk.d) + chP('cx-wf', wk.f);
+    out += chP('cx-up', bd.u) + chP('cx-dn', bd.d) + chP('cx-fl', bd.f) + '</g>';
+    if (chOn.ma60) { out += chP('cx-ma60', chLine(g, o.m60, py)); }
+    if (chOn.ma20) { out += chP('cx-ma20', chLine(g, o.m20, py)); }
+    if (chOn.ma10) { out += chP('cx-ma10', chLine(g, o.m10, py)); }
+    if (chOn.ma5) { out += chP('cx-ma5', chLine(g, o.m5, py)); }
+    if (sv !== null) { out += chP('cx-stop', 'M' + g.x0 + ' ' + r1(ys) + 'H' + r1(g.x1)) + chT('cx-ts', g.x1 + 4, sl + 4, 'start', '停損 ' + c.stop); }
+    if (last) {
+      out += '<circle class="cx-cl" cx="' + r1(chX(g, n - 1)) + '" cy="' + r1(yc) + '" r="3.5"/>';
+      out += chT('cx-tb', g.x1 + 4, cl + 4, 'start', '收 ' + (c.close === null ? (o.c[n - 1] * st).toFixed(dec) : c.close));
+    }
+    out += labs;
+    var prev = -99, yd = ty + hp + 14, lc = g.x1 - 15, t, xx;
     for (i = 0; i < o.tk.length; i++) {
-      t = o.tk[i]; xx = px(t[0]);
-      if (xx >= 14 && xx - prev >= 28 && lc - xx >= 28) { out += txt('cx-t', xx, yd, 'middle', t[1] + '月'); prev = xx; }
+      t = o.tk[i];
+      if (t[0] < a || t[0] >= b) { continue; }
+      xx = chX(g, t[0]);
+      if (xx >= 14 && xx - prev >= 28 && lc - xx >= 28) { out += chT('cx-t', xx, yd, 'middle', t[1] + '月'); prev = xx; }
     }
-    out += txt('cx-t', x1, yd, 'end', (o.mo < 10 ? '0' : '') + o.mo + '/' + (o.dy < 10 ? '0' : '') + o.dy);
-    return out + '</svg>';
+    out += chT('cx-t', g.x1, yd, 'end', chDate(o, b - 1));
+    return out + chP('cx-x', 'M0 0') + '</svg>';
+  }
+  function chSub(c, g, k) {
+    var o = c.o, a = g.a, b = a + g.m, h = k === 'vol' ? (g.small ? 44 : 56) : (g.small ? 56 : 72), y1 = 4 + h, i, x, mx = 1, out = '';
+    var bx = { u: '', d: '', f: '' };
+    function yv(v) { return y1 - v / mx * h; }
+    function yp(v) { return y1 - v / 100 * h; }
+    if (k === 'vol') {
+      for (i = a; i < b; i++) { mx = Math.max(mx, o.v[i], o.mv[i] === null ? 0 : o.mv[i]); }
+      for (i = a; i < b; i++) { x = yv(o.v[i]); bx[chCls(o, i)] += chBar(g, chX(g, i), x, y1 - x); }
+      out = chP('cx-grid', 'M' + g.x0 + ' ' + y1 + 'H' + r1(g.x1)) + '<g class="cg-v">' + chP('cx-up', bx.u) + chP('cx-dn', bx.d) + chP('cx-fl', bx.f) + '</g>';
+      out += chP('cx-mv5', chLine(g, o.mv, yv));
+    } else if (k === 'macd') {
+      for (i = a; i < b; i++) { mx = Math.max(mx, Math.abs(o.dif[i]), Math.abs(o.dea[i]), Math.abs(o.osc[i])); }
+      var yz = 4 + h / 2;
+      var my = function (v) { return yz - v / mx * (h / 2 - 2); };
+      for (i = a; i < b; i++) {
+        if (o.osc[i] !== 0) { x = my(o.osc[i]); bx[o.osc[i] > 0 ? 'u' : 'd'] += chBar(g, chX(g, i), Math.min(x, yz), Math.abs(x - yz)); }
+      }
+      out = chP('cx-grid', 'M' + g.x0 + ' ' + r1(yz) + 'H' + r1(g.x1)) + '<g class="cg-m">' + chP('cx-up', bx.u) + chP('cx-dn', bx.d) + '</g>';
+      out += chP('cx-dea', chLine(g, o.dea, my)) + chP('cx-dif', chLine(g, o.dif, my));
+    } else {
+      out = chP('cx-gd', 'M' + g.x0 + ' ' + r1(yp(80)) + 'H' + r1(g.x1) + 'M' + g.x0 + ' ' + r1(yp(20)) + 'H' + r1(g.x1));
+      out += chP('cx-grid', 'M' + g.x0 + ' ' + r1(yp(50)) + 'H' + r1(g.x1));
+      out += chT('cx-t', g.x1 + 4, yp(80) + 4, 'start', '80') + chT('cx-t', g.x1 + 4, yp(50) + 4, 'start', '50') + chT('cx-t', g.x1 + 4, yp(20) + 4, 'start', '20');
+      if (k === 'kd') { out += chP('cx-d', chLine(g, o.kd, yp)) + chP('cx-k', chLine(g, o.k, yp)); } else { out += chP('cx-d', chLine(g, o.r10, yp)) + chP('cx-k', chLine(g, o.r5, yp)); }
+    }
+    return '<svg viewBox="0 0 ' + g.w + ' ' + (y1 + 4) + '" aria-hidden="true">' + out + chP('cx-x', 'M0 0') + '</svg>';
   }
   function chNum(a) {
     var v = parseFloat(a);
     return isFinite(v) && v > 0 ? v : null;
   }
+  function chSw(cls) {
+    if (cls === 'bar') { return '<path class="cx-up" d="M2 1h8v8h-8z"/><path class="cx-dn" d="M14 1h8v8h-8z"/>'; }
+    if (cls === 'dot') { return '<circle class="cx-cl" cx="12" cy="5" r="3.5"/>'; }
+    return '<path class="cx-' + cls + '" d="M0 5H24"/>';
+  }
   function chLegend(c) {
-    var ul = d.createElement('ul'), it = [['bar', 'K 棒：紅漲綠跌'], ['m20', 'MA20'], ['m60', 'MA60'], ['bb', '布林上下軌']];
+    var it = [['bar', 'K 棒：紅漲綠跌']];
+    CH_MAIN.forEach(function (k) { if (chOn[k]) { it.push([k === 'bb' ? 'bb' : k, k === 'bb' ? '布林上下軌' : CH_NM[k]]); } });
     if (c.stop !== null) { it.push(['stop', '建議停損']); }
-    it.push(['dot', '收盤'], ['mv', '量與 5 日均量'], ['dif', 'DIF'], ['dea', 'DEA'], ['osc', 'MACD 柱：紅正綠負']);
-    ul.className = 'chk';
+    it.push(['dot', '收盤']);
+    if (chOn.vol) { it.push(['mv5', '5 日均量']); }
+    if (chOn.kd) { it.push(['k', 'K'], ['d', 'D']); }
+    if (chOn.macd) { it.push(['dif', 'DIF'], ['dea', 'DEA'], ['bar', 'MACD 柱：紅正綠負']); }
+    if (chOn.rsi) { it.push(['k', 'RSI5'], ['d', 'RSI10']); }
+    if (chOn.kd || chOn.rsi) { it.push(['gd', '80／20 參考線']); }
+    c.lg.textContent = '';
     it.forEach(function (x) {
-      var li = d.createElement('li');
-      li.className = 'lg-' + x[0];
-      li.textContent = x[1];
-      ul.appendChild(li);
+      var li = d.createElement('li'), sp = d.createElement('span');
+      li.innerHTML = '<svg viewBox="0 0 24 10" aria-hidden="true">' + chSw(x[0]) + '</svg>';
+      sp.textContent = x[1];
+      li.appendChild(sp);
+      c.lg.appendChild(li);
     });
-    return ul;
+  }
+  function chBtn(cls, s, lab) {
+    var b = d.createElement('button');
+    b.type = 'button'; b.className = cls; b.textContent = s;
+    if (lab) { b.setAttribute('aria-label', lab); }
+    return b;
+  }
+  function chEl(tag, cls, s) {
+    var e = d.createElement(tag);
+    if (cls) { e.className = cls; }
+    if (s) { e.textContent = s; }
+    return e;
+  }
+  function chFlip(k) {
+    chOn[k] = !chOn[k];
+    chSave();
+    chAll.forEach(function (x) {
+      if (!x.o) { return; }
+      x.dirty = true;
+      if (x.pan && !x.pan.hidden) { chRender(x); }
+    });
+  }
+  function chChips(c, box, keys, lab) {
+    box.setAttribute('role', 'group');
+    box.setAttribute('aria-label', lab);
+    box.appendChild(chEl('span', '', lab));
+    keys.forEach(function (k) {
+      var b = chBtn('chip', CH_NM[k]);
+      b.addEventListener('click', function () { chFlip(k); });
+      c.cb[k] = b;
+      box.appendChild(b);
+    });
+  }
+  function chUi(c) {
+    var v = c.view, z = chEl('div', 'chz'), mi = chEl('div', 'chi'), si = chEl('div', 'chi'), q = chEl('div', 'chq');
+    z.setAttribute('role', 'group');
+    z.setAttribute('aria-label', '顯示範圍');
+    c.rb = [];
+    [[60, '60 日', '顯示最近 60 日'], [120, '120 日', '顯示最近 120 日'], [0, '全部', '顯示全部']].forEach(function (p) {
+      var b = chBtn('chip', p[1], p[2]);
+      b._r = p[0];
+      b.addEventListener('click', function () { chSet(c, p[0] ? c.o.n - p[0] : 0, p[0] || c.o.n); });
+      c.rb.push(b);
+      z.appendChild(b);
+    });
+    c.zo = chBtn('chip', '−', '縮小：看更多天');
+    c.zi = chBtn('chip', '+', '放大：看更少天');
+    c.zr = chBtn('chip', '重設', '重設縮放與十字線');
+    c.zo.addEventListener('click', function () { chZ(c, 1.5); });
+    c.zi.addEventListener('click', function () { chZ(c, 1 / 1.5); });
+    c.zr.addEventListener('click', function () { c.x = -1; chSet(c, 0, c.o.n, true); });
+    z.appendChild(c.zo); z.appendChild(c.zi); z.appendChild(c.zr);
+    c.hint = chEl('span', 'chg');
+    z.appendChild(c.hint);
+    c.ro = chEl('p', 'cho');
+    c.live = chEl('span', 'vh');
+    c.live.setAttribute('aria-live', 'polite');
+    q.tabIndex = 0;
+    q.setAttribute('role', 'group');
+    q.setAttribute('aria-label', 'K 線圖區：左右鍵移動十字線，加號放大，減號縮小，Esc 取消十字線');
+    c.cb = {};
+    c.sp = {};
+    c.mh = chEl('span', 'chv');
+    var mp = chEl('div', 'chs'), hh = chEl('div', 'chh');
+    hh.appendChild(chEl('span', 'chn', '價格'));
+    hh.appendChild(c.mh);
+    c.main = chEl('div');
+    mp.appendChild(hh); mp.appendChild(c.main);
+    q.appendChild(mp);
+    CH_SUB.forEach(function (k) {
+      var p = { box: chEl('div', 'chs'), hd: chEl('div', 'chh'), val: chEl('span', 'chv'), svg: chEl('div') }, x = chBtn('chx', '−', '關閉' + CH_NM[k] + '面板');
+      p.hd.appendChild(chEl('span', 'chn', CH_NM[k]));
+      p.hd.appendChild(p.val);
+      p.hd.appendChild(x);
+      x.addEventListener('click', function () { chFlip(k); if (c.cb[k]) { c.cb[k].focus(); } });
+      p.box.appendChild(p.hd); p.box.appendChild(p.svg);
+      c.sp[k] = p;
+      q.appendChild(p.box);
+    });
+    chChips(c, mi, CH_MAIN, '主圖');
+    chChips(c, si, CH_SUB, '副圖');
+    c.plot = q;
+    v.appendChild(z); v.appendChild(c.ro); v.appendChild(q); v.appendChild(mi); v.appendChild(si); v.appendChild(c.live);
+    chEvents(c);
+  }
+  function chGeo(c) {
+    var w = c.w, x1 = w - 56;
+    return { w: w, small: w < 520, x0: 4, x1: x1, a: c.a, m: c.m, slot: (x1 - 4) / c.m, bw: Math.max(1, (x1 - 4) / c.m * 0.66) };
+  }
+  function chRender(c) {
+    var t0 = Date.now(), o = c.o, g = chGeo(c), last = o.n - 1, de = [], st = Math.pow(10, o.e);
+    function fm(v) { return (v * st).toFixed(Math.max(0, -o.e)); }
+    c.g = g;
+    c.dirty = false;
+    c.main.innerHTML = chMain(c, g);
+    c.main.querySelector('title').textContent = c.code + ' ' + c.name + ' 近 ' + o.n + ' 日 K 線圖';
+    de.push('最後收盤 ' + (c.close === null ? fm(o.c[last]) : c.close));
+    if (c.stop !== null) { de.push('建議停損 ' + c.stop); }
+    if (o.m20[last] !== null) { de.push('MA20 約 ' + fm(o.m20[last])); }
+    if (o.m60[last] !== null) { de.push('MA60 約 ' + fm(o.m60[last])); }
+    de.push('MACD 柱狀體' + (o.osc[last] > 0 ? '為正（紅）' : (o.osc[last] < 0 ? '為負（綠）' : '為零')));
+    c.main.querySelector('desc').textContent = de.join('，');
+    CH_SUB.forEach(function (k) {
+      var p = c.sp[k];
+      p.box.hidden = !chOn[k];
+      p.svg.innerHTML = chOn[k] ? chSub(c, g, k) : '';
+    });
+    CH_MAIN.concat(CH_SUB).forEach(function (k) { c.cb[k].setAttribute('aria-pressed', chOn[k] ? 'true' : 'false'); });
+    c.rb.forEach(function (b) {
+      var m = b._r ? Math.min(b._r, o.n) : o.n;
+      b.setAttribute('aria-pressed', c.m === m && c.a + c.m === o.n ? 'true' : 'false');
+    });
+    c.zi.disabled = c.m <= Math.min(o.n, 20);
+    c.zo.disabled = c.m >= o.n;
+    c.hint.textContent = '顯示 ' + c.m + '／' + o.n + ' 日（' + chDate(o, c.a) + '–' + chDate(o, c.a + c.m - 1) + '）';
+    chLegend(c);
+    c.xp = [];
+    for (var i = 0, ps = c.plot.querySelectorAll('svg'); i < ps.length; i++) {
+      c.xp.push([ps[i].querySelector('.cx-x'), +ps[i].getAttribute('viewBox').split(' ')[3]]);
+    }
+    if (c.x >= 0) { c.x = Math.max(c.a, Math.min(c.a + c.m - 1, c.x)); }
+    chCross(c);
+    chRead(c);
+    c.ms = Date.now() - t0;
+  }
+  function chCross(c) {
+    var x = c.x >= 0 ? r1(chX(c.g, c.x)) : -1;
+    c.xp.forEach(function (p) { p[0].setAttribute('d', x < 0 ? 'M0 0' : 'M' + x + ' 0V' + p[1]); });
+  }
+  function chRead(c) {
+    var o = c.o, i = c.x >= 0 ? c.x : c.a + c.m - 1, st = Math.pow(10, o.e), ms = Math.pow(10, o.me), s, mv = [];
+    function fm(v) { return v === null || v === undefined ? '－' : (v * st).toFixed(Math.max(0, -o.e)); }
+    function f1(v) { return v === null || v === undefined ? '－' : v.toFixed(1); }
+    function f2(v) { return (v * ms).toFixed(2); }
+    function vz(v) { return v === null ? '－' : String(Math.round(v / 675 * o.vk)); }
+    s = chDate(o, i) + (c.x >= 0 ? '' : '（最後一根）') + '  開 ' + fm(o.op[i]) + '  高 ' + fm(o.h[i]) + '  低 ' + fm(o.l[i]) + '  收 ' + fm(o.c[i]);
+    if (i > 0 && o.c[i - 1] > 0) { s += '  漲跌 ' + ((o.c[i] - o.c[i - 1]) / o.c[i - 1] * 100).toFixed(2) + '%'; }
+    c.ro.textContent = s + '  量約 ' + vz(o.v[i]) + ' 張';
+    if (chOn.ma5) { mv.push('MA5 ' + fm(o.m5[i])); }
+    if (chOn.ma10) { mv.push('MA10 ' + fm(o.m10[i])); }
+    if (chOn.ma20) { mv.push('MA20 ' + fm(o.m20[i])); }
+    if (chOn.ma60) { mv.push('MA60 ' + fm(o.m60[i])); }
+    if (chOn.bb) { mv.push('布林 ' + fm(o.up[i]) + '／' + fm(o.lo[i])); }
+    c.mh.textContent = mv.join('  ');
+    c.sp.vol.val.textContent = '量約 ' + vz(o.v[i]) + ' 張  5 日均量約 ' + vz(o.mv[i]) + ' 張';
+    c.sp.kd.val.textContent = 'K ' + f1(o.k[i]) + '  D ' + f1(o.kd[i]);
+    c.sp.macd.val.textContent = 'DIF ' + f2(o.dif[i]) + '  DEA ' + f2(o.dea[i]) + '  OSC ' + f2(o.osc[i]);
+    c.sp.rsi.val.textContent = 'RSI5 ' + f1(o.r5[i]) + '  RSI10 ' + f1(o.r10[i]);
+  }
+  function chSay(c) {
+    clearTimeout(c.lt);
+    c.lt = setTimeout(function () { c.live.textContent = c.hint.textContent + '。' + c.ro.textContent; }, 600);
+  }
+  function chSet(c, a, m, force) {
+    var r = chWin(c.o.n, a, m);
+    c.pa = null;
+    if (!force && r[0] === c.a && r[1] === c.m) { return; }
+    c.a = r[0]; c.m = r[1];
+    chRender(c);
+  }
+  function chZ(c, f) {
+    var t = c.x >= 0 ? (c.x - c.a + 0.5) / c.m : 1, r = chZoom(c.o.n, c.a, c.m, f, t);
+    chSet(c, r[0], r[1]);
+  }
+  function chLater(c, a, m) {
+    c.pa = [a, m];
+    if (c.raf) { return; }
+    c.raf = 1;
+    var go = function () { if (!c.raf) { return; } c.raf = 0; if (c.pa) { chSet(c, c.pa[0], c.pa[1]); } };
+    if (window.requestAnimationFrame) { window.requestAnimationFrame(go); }
+    setTimeout(go, 50);
+  }
+  function chIdx(c, cx) {
+    var sv = c.main.querySelector('svg'), g = c.g, r, x;
+    if (!sv || !g) { return -1; }
+    r = sv.getBoundingClientRect();
+    if (!r.width) { return -1; }
+    x = (cx - r.left) * g.w / r.width;
+    return Math.max(g.a, Math.min(g.a + g.m - 1, g.a + Math.floor((x - g.x0) / g.slot)));
+  }
+  function chPx(c) {
+    var sv = c.main.querySelector('svg'), r = sv ? sv.getBoundingClientRect() : null;
+    return r && r.width ? r.width / c.g.w * c.g.slot : 1;
+  }
+  function chAt(c, i) {
+    if (i === c.x) { return; }
+    c.x = i;
+    chCross(c);
+    chRead(c);
+  }
+  function chEvents(c) {
+    var q = c.plot, P = {}, np = 0, gs = null;
+    function two() {
+      var ids = [], k;
+      for (k in P) { if (P.hasOwnProperty(k)) { ids.push(P[k]); } }
+      return ids.length < 2 ? null : [Math.abs(ids[0].x - ids[1].x) + Math.abs(ids[0].y - ids[1].y), (ids[0].x + ids[1].x) / 2];
+    }
+    function gone(e) {
+      if (P[e.pointerId]) { delete P[e.pointerId]; np--; }
+      if (gs && (gs.k === 'z' || gs.id === e.pointerId)) { clearTimeout(gs.tm); gs = null; }
+    }
+    q.addEventListener('pointerdown', function (e) {
+      var t = e.target, w;
+      if (e.pointerType === 'mouse' && e.button !== 0) { return; }
+      while (t && t !== q) { if (t.tagName === 'BUTTON') { return; } t = t.parentNode; }
+      P[e.pointerId] = { x: e.clientX, y: e.clientY };
+      np++;
+      if (np === 2) {
+        if (gs) { clearTimeout(gs.tm); }
+        w = two();
+        if (w) { gs = { k: 'z', d0: Math.max(20, w[0]), a0: c.a, m0: c.m, t: (chIdx(c, w[1]) - c.a + 0.5) / c.m }; }
+        return;
+      }
+      gs = { k: '', x0: e.clientX, a0: c.a, id: e.pointerId, px: chPx(c) };
+      if (e.pointerType !== 'mouse') {
+        gs.tm = setTimeout(function () { if (gs && gs.k === '') { gs.k = 'x'; chAt(c, chIdx(c, gs.x0)); } }, 350);
+      }
+    });
+    q.addEventListener('pointermove', function (e) {
+      var p = P[e.pointerId], w, r;
+      if (p) { p.x = e.clientX; p.y = e.clientY; }
+      if (gs && gs.k === 'z') {
+        w = two();
+        if (w && w[0] > 10) { r = chZoom(c.o.n, gs.a0, gs.m0, gs.d0 / w[0], gs.t); chLater(c, r[0], r[1]); }
+        return;
+      }
+      if (gs && gs.id === e.pointerId) {
+        if (gs.k === '' && Math.abs(e.clientX - gs.x0) > 8) {
+          gs.k = 'p';
+          clearTimeout(gs.tm);
+          try { q.setPointerCapture(e.pointerId); } catch (er) { }
+        }
+        if (gs.k === 'p') { chLater(c, gs.a0 - (e.clientX - gs.x0) / gs.px, c.m); } else if (gs.k === 'x') { chAt(c, chIdx(c, e.clientX)); }
+        return;
+      }
+      if (!gs && e.pointerType === 'mouse') { chAt(c, chIdx(c, e.clientX)); }
+    });
+    q.addEventListener('pointerup', function (e) {
+      var i;
+      if (gs && gs.id === e.pointerId && gs.k === '') {
+        i = chIdx(c, e.clientX);
+        chAt(c, e.pointerType !== 'mouse' && i === c.x ? -1 : i);
+      }
+      gone(e);
+    });
+    q.addEventListener('pointercancel', gone);
+    q.addEventListener('pointerleave', function (e) {
+      if (e.pointerType === 'mouse' && !gs) { chAt(c, -1); }
+    });
+    q.addEventListener('wheel', function (e) {
+      var dx = e.deltaX, dy = e.deltaY, r, b = c.pa || [c.a, c.m];
+      if (e.ctrlKey && dy) {
+        e.preventDefault();
+        r = chZoom(c.o.n, b[0], b[1], dy > 0 ? 1.2 : 1 / 1.2, (chIdx(c, e.clientX) - c.a + 0.5) / c.m);
+        chLater(c, r[0], r[1]);
+      } else if (dx && Math.abs(dx) > Math.abs(dy)) {
+        e.preventDefault();
+        chLater(c, b[0] + dx / chPx(c), b[1]);
+      }
+    }, { passive: false });
+    q.addEventListener('keydown', function (e) {
+      var k = e.key, i;
+      if (k === 'ArrowLeft' || k === 'ArrowRight') {
+        e.preventDefault();
+        i = c.x < 0 ? c.a + c.m - 1 : Math.max(0, Math.min(c.o.n - 1, c.x + (k === 'ArrowLeft' ? -1 : 1)));
+        if (i < c.a || i >= c.a + c.m) { c.x = i; chSet(c, i < c.a ? i : i - c.m + 1, c.m); } else { chAt(c, i); }
+        chSay(c);
+      } else if (k === '+' || k === '=' || k === '-' || k === '_') {
+        e.preventDefault();
+        chZ(c, k === '+' || k === '=' ? 1 / 1.5 : 1.5);
+        chSay(c);
+      } else if ((k === 'Escape' || e.keyCode === 27) && c.x >= 0) {
+        e.stopPropagation();
+        chAt(c, -1);
+      }
+    });
   }
   function chBuild(c) {
     var tr = d.createElement('tr'), td = d.createElement('td'), box = d.createElement('div');
@@ -1269,28 +1679,18 @@ HTML_JS = r'''
     c.pan = tr; c.box = box;
   }
   function chDraw(c) {
-    var w = Math.max(300, Math.min(980, Math.round(c.box.clientWidth))), o = c.o, ti, de, parts, last, wl, cb;
-    function fm(v) { return (v * Math.pow(10, o.e)).toFixed(Math.max(0, -o.e)); }
-    if (c.drawn && Math.abs(w - c.w) <= 40) { return; }
-    if (!c.drawn) { o = c.o = chDec(c.s); }
+    var w = Math.max(300, Math.min(980, Math.round(c.box.clientWidth))), o = c.o, wl, cb;
+    if (c.drawn && !c.dirty && Math.abs(w - c.w) <= 40) { return; }
     c.w = w;
-    if (!o) {
-      c.view.textContent = '這檔的線圖資料有問題，無法顯示';
-      c.drawn = true;
-      return;
-    }
-    c.view.innerHTML = chSvg(o, w, c.stop, c.close, c.id);
-    ti = c.view.querySelector('title'); de = c.view.querySelector('desc');
-    ti.textContent = c.code + ' ' + c.name + ' 近 ' + o.n + ' 日 K 線圖';
-    last = o.n - 1;
-    parts = ['最後收盤 ' + (c.close === null ? fm(o.c[last]) : c.close)];
-    if (c.stop !== null) { parts.push('建議停損 ' + c.stop); }
-    if (o.m20[last] !== null) { parts.push('MA20 約 ' + fm(o.m20[last])); }
-    if (o.m60[last] !== null) { parts.push('MA60 約 ' + fm(o.m60[last])); }
-    parts.push('MACD 柱狀體' + (o.osc[last] > 0 ? '為正（紅）' : (o.osc[last] < 0 ? '為負（綠）' : '為零')));
-    de.textContent = parts.join('，');
     if (!c.drawn) {
-      c.rest.appendChild(chLegend(c));
+      o = c.o = chDec(c.s);
+      c.drawn = true;
+      if (!o) { c.view.textContent = '這檔的線圖資料有問題，無法顯示'; return; }
+      c.a = 0; c.m = o.n; c.x = -1;
+      chUi(c);
+      c.lg = d.createElement('ul');
+      c.lg.className = 'chk';
+      c.rest.appendChild(c.lg);
       wl = d.createElement('p');
       wl.className = 'chw';
       wl.textContent = '週 MACD：DIF ' + o.wk[3].toFixed(2) + (o.wk[0] ? '（零軸上）' : '（零軸下）') + '、柱 ' + o.wk[4].toFixed(2) + (o.wk[1] ? (o.wk[2] ? '（紅，剛翻紅）' : '（紅）') : '（綠）');
@@ -1304,7 +1704,7 @@ HTML_JS = r'''
       cb.addEventListener('click', function () { chToggle(c, false); c.btn.focus(); });
       c.rest.appendChild(cb);
     }
-    c.drawn = true;
+    if (o) { chRender(c); }
   }
   function chToggle(c, force) {
     var op = c.pan ? c.pan.hidden : true;
@@ -2020,6 +2420,7 @@ def _sec_help(B, ctx):
 <li>停損距離：<span class="d-ok">近</span> 3% 以內，風險空間小；<span class="d-mid">中</span> 3%～6%，普通；<span class="d-wide">遠</span> 超過 6%，停損很遠，單筆虧損會偏大。</li>
 <li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
 <li>K 線圖：候選標的和觀察名單的每一列都有「K 線圖」按鈕（點那一列也可以），展開近 120 個交易日的日 K 線，附 MA20、MA60、布林上下軌、成交量與 MACD；候選標的另外畫出建議停損線。圖上的價格是約略值，精確數字看表格。按 Esc 或「收起」關閉。</li>
+<li>K 線圖的指標與縮放：圖下方的「主圖」「副圖」按鈕選要看的指標（MA5、MA10、MA20、MA60、布林；成交量、KD、MACD、RSI），副圖標題的「−」可以關掉該面板，選擇會記在這個瀏覽器。「60 日」「120 日」「全部」「−」「+」「重設」調整顯示範圍；電腦可用 Ctrl＋滾輪縮放、拖曳平移，手機兩指縮放、單指左右拖曳。滑鼠移到圖上或手機點一下會顯示十字線與當天數值；圖有焦點時可用 ← → 移動、+ − 縮放、Esc 取消。MA5、MA10、KD、RSI 由頁面依圖上的約略價格計算，可能和看盤軟體差一點。</li>
 <li>部位：依「單筆虧損 = 總資金 × 比例」反推股數，1 張 = 1000 股。<span class="p-cap">紫色</span>表示已經買到總資金上限，<span class="p-odd">橘色</span>表示不到 1 張（零股）。沒設定總資金就不會有這一欄。</li>
 <li>觀察名單是第二優先：動能和量能到了、型態還沒到。各關明細檔數多，預設收起來，按「展開」才列出，可以搜尋和排序。</li>
 <li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成主動式、高股息、科技、海外、市值型、債券等；旁邊的小框寫個股或 ETF 與上市／上櫃；候選標的可以用「類股」選單篩選。查不到的標示為未分類（各關明細寫「—」）。</li>
@@ -2104,18 +2505,45 @@ PWA_CSS = '''.hbar{display:flex;flex-direction:column;gap:12px}
 .a2hs{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;font-size:14px;line-height:18px;border:1px solid var(--ink3);border-radius:12px;padding:12px 16px}
 .bnav{display:none}
 .topnav{padding-top:env(safe-area-inset-top,0px)}
+:root{@@GLASS_LIGHT@@}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){@@GLASS_DARK@@}}
+:root[data-theme="dark"]{@@GLASS_DARK@@}
 @media (max-width:734px){
-.bnav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:6;background:var(--nav);border-top:1px solid var(--hairline);padding-bottom:env(safe-area-inset-bottom,0px)}
-.bnav a{flex:1 1 0;min-height:44px;display:flex;align-items:center;justify-content:center;font-size:14px;line-height:18px;color:var(--ink);touch-action:manipulation}
+.bnav{display:flex;position:fixed;left:max(12px,env(safe-area-inset-left,0px));right:max(12px,env(safe-area-inset-right,0px));bottom:calc(8px + env(safe-area-inset-bottom,0px));z-index:6;padding:4px;border-radius:999px;border:1px solid var(--glass-edge);background:linear-gradient(180deg,var(--glass-sheen),rgba(255, 255, 255, 0) 60%),var(--glass);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);box-shadow:inset 0 1px 0 var(--glass-hi),0 8px 24px var(--glass-shadow)}
+.bnav::before{content:"";position:absolute;top:4px;bottom:4px;left:4px;width:calc((100% - 8px) / 3);border-radius:999px;background:var(--lens);border:1px solid var(--lens-edge);box-shadow:inset 0 1px 0 var(--glass-hi);opacity:0;pointer-events:none}
+.bnav.on::before{opacity:1}
+.bnav.at1::before{transform:translateX(100%)}
+.bnav.at2::before{transform:translateX(200%)}
+.bnav a{position:relative;z-index:1;flex:1 1 0;min-height:44px;display:flex;align-items:center;justify-content:center;border-radius:999px;font-size:14px;line-height:18px;color:var(--ink);touch-action:manipulation}
+.bnav a[aria-current]{font-weight:600}
 .bnav a:hover{text-decoration:none}
-.bnav a:active{background:var(--surface)}
+.bnav a:active{background:var(--lens)}
 .hrow{flex-wrap:nowrap}
 .hrow .fld{flex:1 1 0;min-width:0}
 .hrow .fld select{width:100%}
-body{padding-bottom:calc(52px + env(safe-area-inset-bottom,0px))}
+body{padding-bottom:calc(68px + env(safe-area-inset-bottom,0px))}
 }
+@media (prefers-reduced-motion:no-preference){.bnav::before{transition:transform 160ms ease-out}}
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.bnav{background:var(--nav);border-color:var(--ink3)}}
+@media (prefers-reduced-transparency:reduce){.bnav{background:var(--nav);border-color:var(--ink3);-webkit-backdrop-filter:none;backdrop-filter:none}.bnav::before{background:var(--surface);border-color:var(--ink3)}}
+@media (forced-colors:active){.bnav{background:Canvas;border:1px solid CanvasText;box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none}.bnav::before{display:none}.bnav a[aria-current]{border:2px solid CanvasText}}
 @media (display-mode:standalone){.a2hs{display:none}}
 '''
+# 底部快速切換列的玻璃色（r, g, b, 透明度）。測試會把它疊在最極端的底色（含純黑、純白）上算 WCAG 對比，字要 ≥ 4.5:1
+GLASS = dict(
+    light=dict(glass=(250, 250, 252, .85), sheen=(255, 255, 255, .5), lens=(255, 255, 255, .7), lens_edge=(0, 0, 0, .12),
+               glass_edge=(255, 255, 255, .7), glass_hi=(255, 255, 255, .8), glass_shadow=(0, 0, 0, .16)),
+    dark=dict(glass=(22, 22, 23, .85), sheen=(255, 255, 255, .06), lens=(255, 255, 255, .14), lens_edge=(255, 255, 255, .22),
+              glass_edge=(255, 255, 255, .16), glass_hi=(255, 255, 255, .14), glass_shadow=(0, 0, 0, .5)),
+)
+
+
+def _glass_vars(d):
+    return ';'.join('--%s:rgba(%d, %d, %d, %s)' % ((k.replace('_', '-'),) + v[:3] + (('%g' % v[3]).lstrip('0'),))
+                    for k, v in d.items())
+
+
+PWA_CSS = PWA_CSS.replace('@@GLASS_LIGHT@@', _glass_vars(GLASS['light'])).replace('@@GLASS_DARK@@', _glass_vars(GLASS['dark']))
 
 # 全部包在 try 裡，出錯也不影響 SHARE_JS；只用 ES5；不用註解、不寫網址、不用 data／mode 當名稱（會碰到洩漏檢查的規則）
 PWA_JS = r'''
@@ -2155,12 +2583,37 @@ PWA_JS = r'''
         ah.hidden = false;
       }
     }
+    try {
+      var bn = el('bnav'), bl = bn ? bn.querySelectorAll('a') : [], bt = [], bk = -1, bq = false, bi;
+      for (bi = 0; bi < bl.length; bi++) { bt.push(el(bl[bi].getAttribute('href').slice(1))); }
+      var spot = function () {
+        var k = 0, lim = (window.innerHeight || 0) * 0.4, de = d.documentElement, j;
+        bq = false;
+        for (j = 0; j < bt.length; j++) { if (bt[j] && bt[j].getBoundingClientRect().top <= lim) { k = j; } }
+        if (bt.length && window.innerHeight + (window.pageYOffset || de.scrollTop) >= de.scrollHeight - 2) { k = bt.length - 1; }
+        if (k === bk || !bl.length) { return; }
+        bk = k;
+        for (j = 0; j < bl.length; j++) {
+          if (j === k) { bl[j].setAttribute('aria-current', 'location'); } else { bl[j].removeAttribute('aria-current'); }
+        }
+        bn.className = 'bnav on at' + k;
+      };
+      if (bl.length) {
+        window.addEventListener('scroll', function () {
+          if (bq) { return; }
+          bq = true;
+          if (window.requestAnimationFrame) { requestAnimationFrame(spot); } else { setTimeout(spot, 50); }
+        }, { passive: true });
+        window.addEventListener('resize', spot);
+        spot();
+      }
+    } catch (e) { }
     var bar = el('hbar');
     if (!bar || !window.fetch || !web) { return; }
     var TODAY = bar.getAttribute('data-day') || '', TC = ymd(TODAY);
     var h2 = el('cands-h'), view = el('hview'), trend = el('htrend'), nav = el('bnav');
     var h2txt = h2 ? h2.textContent : '', days = [], cache = {}, shown = '', cur = '', hid = [], sum0 = '';
-    var stat = mk('p', 'status'), sel = mk('select'), prev = mk('button', 'chip', '◀'), next = mk('button', 'chip', '▶');
+    var stat = mk('p', 'status'), sel = mk('select'), prev = mk('button', 'chip', '前一天'), next = mk('button', 'chip', '後一天');
     var gone = mk('div', 'hgone');
     var DOW = ['日', '一', '二', '三', '四', '五', '六'];
     function dow(s) { var p = s.split('-'); return '星期' + DOW[new Date(+p[0], +p[1] - 1, +p[2]).getDay()]; }
@@ -2473,6 +2926,7 @@ def _share_help(pwa=False):
 <li>停損距離：<span class="d-ok">近</span> 3% 以內，停損很近；<span class="d-mid">中</span> 3%～6%，普通；<span class="d-wide">遠</span> 超過 6%，停損很遠，一旦停損虧損會偏大。</li>
 <li>價位圖：一條刻度上畫出收盤（圓點）、MA20（灰線）、建議停損（橘線，橘色粗段是收盤到停損的距離），有資料時灰色底是布林通道上下軌；實際數字寫在圖下方。</li>
 <li>K 線圖：每一列都有「K 線圖」按鈕（點那一列也可以），展開近 120 個交易日的日 K 線，附 MA20、MA60、布林上下軌、成交量與 MACD，並畫出建議停損線。圖上的價格是約略值，精確數字看表格；候選太多時只有前面的標的有圖。按 Esc 或「收起」關閉。</li>
+<li>K 線圖的指標與縮放：圖下方的「主圖」「副圖」按鈕選要看的指標（MA5、MA10、MA20、MA60、布林；成交量、KD、MACD、RSI），副圖標題的「−」可以關掉該面板，選擇會記在這個瀏覽器。「60 日」「120 日」「全部」「−」「+」「重設」調整顯示範圍；電腦可用 Ctrl＋滾輪縮放、拖曳平移，手機兩指縮放、單指左右拖曳。滑鼠移到圖上或手機點一下會顯示十字線與當天數值；圖有焦點時可用 ← → 移動、+ − 縮放、Esc 取消。MA5、MA10、KD、RSI 由頁面依圖上的約略價格計算，可能和看盤軟體差一點。</li>
 <li>類股：官方的產業別，例如「科技-半導體」「航運」；ETF 依代號最後一碼與名稱分成主動式、高股息、科技、海外、市值型、債券等；旁邊的小框寫個股或 ETF 與上市／上櫃；候選標的可以用「類股」選單篩選。</li>
 <li>頁面右上角可切換自動（跟著電腦或手機）／淺色／深色，選擇記在這個瀏覽器；無痕或封鎖網站資料時只在這次有效。手機上表格會改成一張一張的卡片。</li>
 </ul>
@@ -2480,7 +2934,7 @@ def _share_help(pwa=False):
 </div></section>"""
     if not pwa:
         return s
-    more = ('<li>歷史紀錄：每個交易日收盤後新增一天，保留最近 120 個交易日。日期列的 ◀ ▶ 或選單可以切換到過去的某一天'
+    more = ('<li>歷史紀錄：每個交易日收盤後新增一天，保留最近 120 個交易日。日期列的「前一天」「後一天」或選單可以切換到過去的某一天'
             '（過去的日期只列出當天的候選標的，沒有圖和篩選）。標的名稱旁的「新增」表示前一個交易日沒有上榜，「續留・第 N 天」表示連續上榜的天數。</li>\n'
             '<li>加到主畫面：手機瀏覽器的選單有「加入主畫面」（iPhone 用 Safari 的分享選單），之後像 App 一樣開啟。看過的頁面沒有網路也能開，'
             '但資料不一定是最新的，瀏覽器也可能清掉離線資料。</li>\n')

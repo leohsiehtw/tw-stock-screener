@@ -54,13 +54,13 @@ class TestGolden(unittest.TestCase):
 
     def test_pwa_off_pages_are_byte_identical_to_before(self):
         self.assertEqual(self.H(screener.render_share_html(tu.fake_results())),
-                         '7bfc927d1c70a189a4e464b1fb2159049f7ce0c40b0b089bfb2e0b8644903744')
+                         '259f80ac7359eda09389753884175377e07d7bfaa147b8a84955f00bc2e7459a')
         charts = {c: screener.chart_code(screener.chart_series(tu.rw_bars(150, i + 1)))
                   for i, c in enumerate(('1101', '2330', '00646', '6874', '2454'))}
         self.assertEqual(self.H(screener.render_share_html(tu.fake_results(), None, charts)),
-                         'da1e0851529117a2f75614c62bf8fc13650d5f7830b2fdac344e5aff7a3e1caf')
+                         'd0179185c1d2bd73a0902c81b50b5c92b4e87d3bc6fe6a857a645936e836a52b')
         self.assertEqual(self.H(screener.render_html(tu.fake_results(), False, tu.meta_for())),
-                         '372d62413afa22e69c1ad102ef125d88efee6179c6c0c19d21ff2ac8599f2346')
+                         'a9b061cfc991d02437cae865c025c79e3a0e63621ad0e8fb436c2716b73495be')
 
     def test_pwa_page_needs_pwa_flag(self):
         page = pwa_page().encode('utf-8')
@@ -1105,6 +1105,90 @@ class TestPwaStatic(unittest.TestCase):
                   'env(safe-area-inset-top,0px)', '@media (display-mode:standalone)', '.a2hs', 'padding-bottom'):
             self.assertIn(s, css, s)
 
+    def test_glass_bar_css(self):
+        css = screener.PWA_CSS
+        self.assertNotIn('@@', css)
+        mq = css[css.index('@media (max-width:734px){'):]
+        mq = mq[:mq.index('\n}\n')]
+        rule = mq[mq.index('.bnav{'):]
+        rule = rule[:rule.index('}')]
+        for s in ('position:fixed', 'border-radius:999px', '-webkit-backdrop-filter:blur(', 'backdrop-filter:blur(', 'saturate(',
+                  'box-shadow:inset 0 1px 0', 'env(safe-area-inset-bottom,0px)', 'env(safe-area-inset-left,0px)',
+                  'env(safe-area-inset-right,0px)', 'var(--glass)'):
+            self.assertIn(s, rule, s)
+        self.assertIn('.bnav{display:none}', css[:css.index('@media (max-width:734px)')])     # 桌機不顯示，和以前一樣
+        # backdrop-filter 只用在 .bnav 這一個元素（不含關掉用的 none）
+        for m in re.finditer(r'([^{}]*)\{[^{}]*backdrop-filter:(?!none)', css):
+            self.assertEqual(m.group(1).strip(), '.bnav')
+        for s in ('@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.bnav{background:var(--nav);border-color:var(--ink3)}}',
+                  '@media (prefers-reduced-transparency:reduce){.bnav{background:var(--nav);border-color:var(--ink3);',
+                  '@media (forced-colors:active){.bnav{background:Canvas;border:1px solid CanvasText;'):
+            self.assertIn(s, css, s)
+        self.assertIn('.bnav a{position:relative;z-index:1;flex:1 1 0;min-height:44px', mq)
+        for k in range(1, 3):
+            self.assertIn('.bnav.at%d::before{transform:translateX(%d00%%)}' % (k, k), mq)
+        self.assertEqual(screener.PWA_BNAV.count('<a href="#'), 3)                       # 鏡片寬度是 1/3
+        self.assertIn('calc((100% - 8px) / 3)', mq)
+        self.assertNotIn('outline:none', css)                                             # 焦點框沿用全域的 2px／3px
+        self.assertEqual(emoji_hits(css), [])
+        js = screener.PWA_JS
+        for s in ("setAttribute('aria-current', 'location')", "removeAttribute('aria-current')", "'bnav on at' + k",
+                  '{ passive: true }', 'requestAnimationFrame'):
+            self.assertIn(s, js, s)
+        self.assertLess(js.index("el('bnav')"), js.index("var bar = el('hbar')"))     # file:// 或沒有歷史時也會標出目前段落
+
+    def test_only_motion_is_lens_slide(self):
+        """整頁只有一個轉場：鏡片的 transform，≤ 180ms、ease-out，只在 prefers-reduced-motion:no-preference 裡；沒有 animation／@keyframes"""
+        page = pwa_page()
+        for t in (screener.PWA_CSS, page):
+            self.assertNotRegex(t, r'animation|@keyframes')
+            self.assertEqual(len(re.findall(r'transition', t)), 1)
+        m = re.search(r'@media \(prefers-reduced-motion:no-preference\)\{\.bnav::before\{transition:transform ([0-9]+)ms ease-out\}\}',
+                      screener.PWA_CSS)
+        self.assertTrue(m)
+        self.assertLessEqual(int(m.group(1)), 180)
+        self.assertNotRegex(screener.HTML_CSS, r'transition|animation|@keyframes')
+
+    def test_glass_contrast_worst_case(self):
+        """玻璃列的字在最壞的底色上（頁面各種底色、漲跌色、純黑、純白；加上頂端反光、選取鏡片）仍 ≥ 4.5:1；焦點框 ≥ 3:1"""
+        def over(top, base):
+            a = top[3]
+            return tuple(round(a * top[i] + (1 - a) * base[i]) for i in range(3))
+
+        def hx(c):
+            return '#%02x%02x%02x' % c
+
+        def rgb(h):
+            h = h.lstrip('#')
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        backs = {'#000000', '#ffffff'}
+        for p in screener.PALETTE.values():
+            backs |= {p[k] for k in ('page', 'surface', 'nav', 'band', 'up', 'down', 'ink', 'ink2', 'link', 'warn', 'cap')}
+        worst = {}
+        for mode, g in screener.GLASS.items():
+            p = screener.PALETTE[mode]
+            self.assertGreaterEqual(g['glass'][3], .72 if mode == 'light' else .6, mode)
+            low_text = low_lens = low_ring = 99
+            for b in backs:
+                for sheen in (0, g['sheen'][3]):                                 # 反光由上往下淡出：上緣最強、下半部沒有
+                    c = over(g['glass'], rgb(b))
+                    c = over(g['sheen'][:3] + (sheen,), c)
+                    lens = over(g['lens'], c)
+                    low_text = min(low_text, tu.wcag_ratio(p['ink'], hx(c)))
+                    low_lens = min(low_lens, tu.wcag_ratio(p['ink'], hx(lens)))
+                    low_ring = min(low_ring, tu.wcag_ratio(p['accent'], hx(c)))
+            worst[mode] = (low_text, low_lens, low_ring)
+            self.assertGreaterEqual(low_text, 4.5, mode)
+            self.assertGreaterEqual(low_lens, 4.5, mode)
+            self.assertGreaterEqual(low_ring, 3, mode)
+            # 退回不透明（不支援模糊、減少透明度）時：nav 實色上的字
+            self.assertGreaterEqual(tu.wcag_ratio(p['ink'], p['nav']), 7, mode)
+            for k, v in g.items():
+                self.assertIn('--%s:rgba(%d, %d, %d, %s)' % ((k.replace('_', '-'),) + v[:3] + (('%g' % v[3]).lstrip('0'),)),
+                              screener.PWA_CSS, k)
+        if os.environ.get('GLASS_PRINT'):
+            print('\nglass worst-case (text, lens, ring):', {k: tuple(round(x, 2) for x in v) for k, v in worst.items()})
+
     def test_sizes(self):
         res = [tu.fake_rec('%d' % (1100 + i), '標的%d' % i, 50 + i, 0.5, 1 + i / 100, '回測型', 45 + i) for i in range(150)]
         big = screener.history_json(screener.share_rows(res), '2026-10-22', 2300, 2290, {r['code']: 12 for r in res})
@@ -1136,6 +1220,46 @@ class TestPwaStatic(unittest.TestCase):
         t = tu.readb(os.path.join(ROOT, '設定.範例.txt')).decode('utf-8')
         self.assertIn('\nshare_pwa=0', t)
         self.assertIn('--confirm-pwa', tu.readb(os.path.join(ROOT, 'README.md')).decode('utf-8'))
+
+
+# 會被畫成 emoji 的字（Extended_Pictographic／Emoji=Yes 的常見範圍）；▲ ▼ ✓ ✗ 不是 emoji，可以用
+EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B50, 0x2B50), (0x2B55, 0x2B55), (0x25B6, 0x25B6), (0x25C0, 0x25C0),
+                (0x25AA, 0x25AB), (0x25FB, 0x25FE), (0x23E9, 0x23FA), (0x2194, 0x2199), (0x21A9, 0x21AA), (0x231A, 0x231B),
+                (0x2328, 0x2328), (0x23CF, 0x23CF), (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x3030, 0x3030),
+                (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299), (0xA9, 0xA9), (0xAE, 0xAE), (0x203C, 0x203C),
+                (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139), (0x24C2, 0x24C2), (0xFE0F, 0xFE0F))
+EMOJI_OK = {0x2713, 0x2717}
+
+
+def emoji_hits(t):
+    return sorted({'U+%04X' % ord(ch) for ch in t if ord(ch) not in EMOJI_OK and any(a <= ord(ch) <= z for a, z in EMOJI_RANGES)})
+
+
+class TestNoEmoji(tu.TempCase):
+    def test_table_itself(self):
+        self.assertEqual(emoji_hits('▲▼✓✗，。、：；「」（）／－–—…台股 K 線 MA20 −+'), [])
+        for ch in '📈◀▶✔✅❌⚠★⭐©®™↔↩⏩':
+            self.assertTrue(emoji_hits(ch), ch)
+
+    def test_outputs_and_sources_have_no_emoji(self):
+        res = tu.fake_results()
+        charts = {c: screener.chart_code(screener.chart_series(tu.rw_bars(150, i + 1))) for i, c in enumerate(('1101', '2330', '2454'))}
+        csvp = os.path.join(self.tmp, 'x.csv')
+        screener.write_csv(csvp, res, 1000000)
+        texts = dict(full=screener.render_html(res, False, tu.meta_for(charts=charts)), share=pwa_page(charts=charts),
+                     plain=screener.render_share_html(res, None, charts), txt=screener.push_text(res, False),
+                     md=screener.report(res, False), csv=tu.readb(csvp).decode('utf-8-sig'),
+                     sw=share.sw_bytes('20261022-0123abcd', ['history/20261022.json']).decode('utf-8'),
+                     manifest=share.manifest_bytes().decode('utf-8'), icon=share.ICON_SVG,
+                     hist=screener.history_json(screener.share_rows(res), '2026-10-22', 2300, 2290, {}))
+        for f in ('screener.py', 'share.py', 'fetch_data.py', 'README.md', 'CHANGELOG.md', '設定.範例.txt', 'run.bat', 'setup.bat',
+                  'run_daily.bat', os.path.join('tests', 'test_usability.py'), os.path.join('tests', 'test_share.py')):
+            texts[f] = tu.readb(os.path.join(ROOT, f)).decode('utf-8')
+        for k, t in texts.items():
+            if isinstance(t, bytes):
+                t = t.decode('utf-8')
+            self.assertEqual(emoji_hits(t), [], k)
+        self.assertTrue(screener.push_text(res, False).startswith('盤後選股 '))
 
 
 if __name__ == '__main__':

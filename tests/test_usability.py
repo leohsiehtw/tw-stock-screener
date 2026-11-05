@@ -2,7 +2,7 @@
 
 執行：python -m unittest discover -s tests -v
 """
-import argparse, contextlib, csv, datetime as dt, gzip, http.client, io, json, os, re, subprocess, sys, tempfile
+import argparse, contextlib, shutil, csv, datetime as dt, gzip, http.client, io, json, os, re, subprocess, sys, tempfile
 import threading, time, unittest, _thread
 import urllib.error, urllib.parse
 from unittest import mock
@@ -2318,7 +2318,7 @@ def ref_chart_decode(s):
             a.append(x)
         return a
     o = {}
-    assert u() == 1
+    assert u() == 2
     n = o['n'] = u()
     o['e'] = u() - 2
     o['mo'], o['dy'] = u(), u()
@@ -2336,6 +2336,15 @@ def ref_chart_decode(s):
     dif, osc = run(n), run(n)
     b = u()
     o.update(c=c, o=op, h=h, l=lo_, m20=m20, m60=m60, bw=bw, v=v, mv=mv, dif=dif, osc=osc, wk=(b & 1, b >> 1 & 1, b >> 2 & 1, z(), z()))
+    o['yr'], o['vk'], g = 2000 + u(), u(), []
+    while len(g) < n - 1:
+        t = u()
+        g += [u(), u()] if t == 25 else [t // 5, t % 5]
+    last = dt.date(o['yr'], o['mo'], o['dy'])
+    off = [0]
+    for x in reversed(g[:n - 1]):
+        off.insert(0, off[0] + x + 1)
+    o['dates'] = [(last - dt.timedelta(days=k)).isoformat() for k in off]
     assert p[0] == len(s)
     return o
 
@@ -2403,6 +2412,8 @@ class TestChart(unittest.TestCase):
                     self.assertTrue(0 <= d['v'][i] <= 675)
                 self.assertEqual((d['mo'], d['dy']), (int(s['date'][-1][5:7]), int(s['date'][-1][8:10])))
                 self.assertEqual(d['wk'][3], round(s['wk'][0] * 100))
+                self.assertEqual(d['dates'], s['date'])
+                self.assertEqual(d['vk'], round(max(s['v']) / 1000))
                 self.assertEqual(bool(d['wk'][2]), bool(s['wk'][2]))
 
     def test_t3_edges(self):
@@ -2540,6 +2551,195 @@ class TestChart(unittest.TestCase):
         print('\n[T8] data-ch 平均長度 %.0f（最大 %d）' % (avg, max(lens)))
         self.assertLessEqual(avg, 2600)
         self.assertLess(max(lens), screener.CHART_MAX)
+
+
+def ref_kd(h, l, c, w=0):
+    """KD(9,3,3) 參考算法（和頁面的 chKD 同一個定義）"""
+    K, D, k, q = [], [], 50.0, 50.0
+    for i in range(len(c)):
+        if i < 8:
+            K.append(None)
+            D.append(None)
+            continue
+        hh, ll = max(h[i - 8:i + 1]), min(l[i - 8:i + 1])
+        rv = (c[i] - ll) / (hh - ll) * 100 if hh > ll else 50
+        k = k * 2 / 3 + rv / 3
+        q = q * 2 / 3 + k / 3
+        K.append(None if i < w else k)
+        D.append(None if i < w else q)
+    return K, D
+
+
+def ref_rsi(c, n, w=0):
+    """RSI（Wilder）參考算法"""
+    r, g, s = [], 0.0, 0.0
+    for i in range(len(c)):
+        x = c[i] - c[i - 1] if i else 0
+        if i <= n:
+            g, s = g + max(x, 0), s + max(-x, 0)
+            if i == n:
+                g, s = g / n, s / n
+        else:
+            g, s = (g * (n - 1) + max(x, 0)) / n, (s * (n - 1) + max(-x, 0)) / n
+        r.append(None if i < n or i < w else (g / (g + s) * 100 if g + s > 0 else 50))
+    return r
+
+
+def round_js(x):
+    import math
+    return math.floor(x + 0.5)
+
+
+def ref_win(n, a, m):
+    m = max(min(n, 20), min(n, round_js(m)))
+    return [max(0, min(n - m, round_js(a))), m]
+
+
+def ref_zoom(n, a, m, f, t):
+    m2 = ref_win(n, 0, m * f)[1]
+    return ref_win(n, a + t * (m - m2), m2)
+
+
+def js_funcs(*names):
+    out = []
+    for nm in names:
+        m = re.search(r'\n  function %s\(.*?\n  }\n' % nm, screener.HTML_JS, re.S)
+        assert m, nm
+        out.append(m.group(0))
+    return ''.join(out)
+
+
+NODE = shutil.which('node')
+
+
+def run_node(src, payload):
+    p = subprocess.run([NODE, '-e', src], input=json.dumps(payload), capture_output=True, text=True, encoding='utf-8', timeout=60)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+NODE_MAIN = """
+var s = '';
+process.stdin.on('data', function (x) { s += x; });
+process.stdin.on('end', function () { var a = JSON.parse(s); process.stdout.write(JSON.stringify(a.map(go))); });
+"""
+
+
+class TestChartIndicators(unittest.TestCase):
+    """頁面上的指標、縮放（JS）和 Python 參考算法比對；沒有 node 就跳過要跑 JS 的部分"""
+
+    def close(self, a, b, tol, tag):
+        self.assertEqual(len(a), len(b), tag)
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x is None or y is None:
+                self.assertEqual(x, y, (tag, i))
+            else:
+                self.assertLessEqual(abs(x - y), tol, (tag, i, x, y))
+
+    @unittest.skipUnless(NODE, 'node not installed')
+    def test_i1_js_matches_reference(self):
+        src = js_funcs('chSma', 'chKD', 'chRSI') + """
+function go(q) { var kd = chKD(q.h, q.l, q.c, q.w); return [chSma(q.c, 5), kd[0], kd[1], chRSI(q.c, 5, q.w), chRSI(q.c, 10, q.w)]; }
+""" + NODE_MAIN
+        import random
+        cases = []
+        for seed in range(12):
+            d = ref_chart_decode(screener.chart_code(screener.chart_series(rw_bars(150, seed, 0.9, base=5 + seed * 40))))
+            cases.append(dict(h=d['h'], l=d['l'], c=d['c'], w=seed % 3 * 11))
+        flat = [100] * 40
+        cases.append(dict(h=flat, l=flat, c=flat, w=0))
+        rnd = random.Random(5)
+        c = [rnd.randint(90, 110) for _ in range(60)]
+        cases.append(dict(h=[x + rnd.randint(0, 3) for x in c], l=[x - rnd.randint(0, 3) for x in c], c=c, w=0))
+        got = run_node(src, cases)
+        for k, (q, g) in enumerate(zip(cases, got)):
+            K, D = ref_kd(q['h'], q['l'], q['c'], q['w'])
+            sm = [None if i < 4 else sum(q['c'][i - 4:i + 1]) / 5 for i in range(len(q['c']))]
+            for tag, a, b in (('sma', g[0], sm), ('k', g[1], K), ('d', g[2], D), ('r5', g[3], ref_rsi(q['c'], 5, q['w'])),
+                              ('r10', g[4], ref_rsi(q['c'], 10, q['w']))):
+                self.close(a, b, 1e-9, (k, tag))
+        self.assertEqual(set(x for x in got[-2][1] if x is not None), {50})
+
+    @unittest.skipUnless(NODE, 'node not installed')
+    def test_i2_approximation_vs_full_history(self):
+        """頁面只有 120 根、價格 4 位有效數：和用完整歷史、不量化算出來的值比，畫出來的部分誤差要小"""
+        src = js_funcs('chSma', 'chKD', 'chRSI', 'chDec') + """
+function go(s) { var o = chDec(s); return [o.k, o.kd, o.r5, o.r10, o.n, o.vk]; }
+""" + NODE_MAIN
+        codes, full = [], []
+        for seed in range(16):
+            bars = rw_bars(260, seed, 0.85, base=8 + seed * 37)
+            codes.append(screener.chart_code(screener.chart_series(bars)))
+            adj = bars[-1]['raw_close'] / bars[-1]['close']
+            full.append([[b[k] * adj for b in bars] for k in ('high', 'low', 'close')])
+        got = run_node(src, codes)
+        worst, tot, cnt = [0.0] * 4, [0.0] * 4, [0] * 4
+        for (h, l, c), g in zip(full, got):
+            n = g[4]
+            K, D = ref_kd(h, l, c)
+            ref = [K[-n:], D[-n:], ref_rsi(c, 5)[-n:], ref_rsi(c, 10)[-n:]]
+            for j in range(4):
+                for x, y in zip(g[j], ref[j]):
+                    if x is not None:
+                        worst[j] = max(worst[j], abs(x - y))
+                        tot[j] += abs(x - y)
+                        cnt[j] += 1
+            self.assertEqual([x is None for x in g[0]], [i < 22 for i in range(n)])
+            self.assertEqual([x is None for x in g[3]], [i < 40 for i in range(n)])
+        mean = [t / k for t, k in zip(tot, cnt)]
+        print('\n[I2] 最大誤差 K %.3f D %.3f RSI5 %.3f RSI10 %.3f；平均 %.3f %.3f %.3f %.3f' % tuple(worst + mean))
+        self.assertLess(max(worst), 2.5, worst)
+        self.assertLess(max(mean), 0.3, mean)
+
+    @unittest.skipUnless(NODE, 'node not installed')
+    def test_i3_zoom_window(self):
+        src = js_funcs('chWin', 'chZoom') + """
+function go(q) { return q.length === 3 ? chWin(q[0], q[1], q[2]) : chZoom(q[0], q[1], q[2], q[3], q[4]); }
+""" + NODE_MAIN
+        import random
+        rnd = random.Random(1)
+        cases = []
+        for _ in range(400):
+            n = rnd.choice((2, 15, 20, 21, 80, 119, 120))
+            cases.append([n, rnd.uniform(-30, 150), rnd.uniform(-5, 200)])
+            w = ref_win(n, rnd.uniform(0, n), rnd.uniform(1, n))
+            cases.append([n, w[0], w[1], rnd.choice((1 / 1.5, 1.5, 1.2, 1 / 1.2, 0.1, 9)), rnd.random()])
+        got = run_node(src, cases)
+        for q, g in zip(cases, got):
+            want = ref_win(*q) if len(q) == 3 else ref_zoom(*q)
+            self.assertEqual(g, want, q)
+            n, (a, m) = q[0], g
+            self.assertTrue(min(n, 20) <= m <= n and 0 <= a <= n - m, (q, g))
+
+    def test_i4_zoom_properties(self):
+        self.assertEqual(ref_win(120, 0, 120), [0, 120])
+        self.assertEqual(ref_win(120, 60, 60), [60, 60])
+        self.assertEqual(ref_win(120, 0, 5), [0, 20])
+        self.assertEqual(ref_win(12, 3, 5), [0, 12])
+        self.assertEqual(ref_win(120, 200, 30), [90, 30])
+        a, m = 0, 120
+        for _ in range(10):
+            a, m = ref_zoom(120, a, m, 1 / 1.5, 1)
+            self.assertEqual(a + m, 120)
+        self.assertEqual(m, 20)
+        a, m = ref_zoom(120, 40, 40, 1 / 1.5, 0.5)
+        self.assertLessEqual(abs((a + m / 2) - 60), 1)
+
+    def test_i5_js_static(self):
+        js, sj, css = screener.HTML_JS, screener.SHARE_JS, screener.HTML_CSS
+        for line in js.split('\n'):
+            if 'localStorage' in line:
+                self.assertIn('try', line, line)
+        for k in ('twss-ind', 'chKD', 'chRSI', 'chZoom', 'pointerdown', 'pointercancel', "'wheel'", 'passive: false', 'aria-pressed',
+                  'aria-live', 'ctrlKey', 'ArrowLeft', 'setPointerCapture', '前一天'):
+            self.assertIn(k, sj + screener.PWA_JS, k)
+        m = re.search(r"var chOn = (\{[^}]*\})", js)
+        self.assertEqual(set(re.findall(r'(\w+): true', m.group(1))), {'ma20', 'ma60', 'bb', 'vol', 'macd'})
+        self.assertRegex(css, r'\.chq\{touch-action:pan-y')
+        self.assertIn('.chp .chip,.chx{min-height:44px;min-width:44px}', css)
+        self.assertLess(js.index('function chEvents'), js.index('\n  // 觀察名單\n'))
+        page = screener.render_html(fake_results(), False, meta_for(charts={'1101': screener.chart_code(screener.chart_series(rw_bars(150, 1)))}))
+        self.assertEqual(page.count('<script'), 3)
 
 
 if __name__ == '__main__':

@@ -17,3 +17,5 @@ __pycache__/
 交易*
 *.token
 .env
+# graphify 程式圖譜（本機查詢用，不進版控、不進 release、不進公開頁）
+graphify-out/
